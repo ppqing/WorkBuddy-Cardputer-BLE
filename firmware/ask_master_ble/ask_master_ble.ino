@@ -10,7 +10,6 @@
 
 enum State {
     SLEEP,
-    WAKE,
     IDLE,
     RENDERING,
     WAITING_INPUT,
@@ -51,6 +50,13 @@ static portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 
 int scrollOffset = 0;
 int maxScrollOffset = 0;
+
+// BLE 回调运行在 NimBLE 任务（core 0），主循环运行在 core 1。
+// 如果回调里直接画屏，两个核会并发抢 SPI 总线，导致 ST7789 收到
+// 错乱的 setAddrWindow + 像素数据，屏幕花屏且不自愈。
+// 回调只设标志，绘制统一在 loop()（core 1）执行。
+static volatile bool bleJustConnected = false;
+static volatile bool bleJustDisconnected = false;
 
 unsigned long lastActivityTime = 0;
 unsigned long lastIdleRedraw = 0;
@@ -109,14 +115,15 @@ void setup() {
     drawSleepScreen();
 
     // 注册 BLE 回调
+    // 回调运行在 NimBLE 任务（core 0），绝不能在这里画屏，
+    // 否则与主循环（core 1）的绘制并发抢 SPI 导致花屏。
+    // 只设标志位，loop() 检测后在 core 1 统一绘制。
     M5Cardputer.BLE.setConnectionCallback([](bool connected) {
         DBG(String("BLE ") + (connected ? "connected" : "disconnected"));
         if (connected) {
-            currentState = IDLE;
-            lastActivityTime = millis();
-            drawIdle();
+            bleJustConnected = true;
         } else {
-            transitionToSleep();
+            bleJustDisconnected = true;
         }
     });
     M5Cardputer.BLE.setRecvCallback(onBLEReceive);
@@ -130,6 +137,19 @@ void setup() {
 
 void loop() {
     M5Cardputer.update();
+
+    // 处理 BLE 连接状态变化（从 core 0 回调转交到 core 1 执行）
+    if (bleJustConnected) {
+        bleJustConnected = false;
+        currentState = IDLE;
+        lastActivityTime = millis();
+        drawIdle();
+    }
+    if (bleJustDisconnected) {
+        bleJustDisconnected = false;
+        transitionToSleep();
+    }
+
     handleBLEInput();
 
     if (currentState == IDLE) {
@@ -388,12 +408,6 @@ void handleKeyboard() {
                 drawIdleScreen(APP_VERSION, info.c_str(), false);
                 delay(1500);
                 transitionToSleep();
-                return;
-            }
-            if (c == ' ' || c == 'w' || c == 'W') {
-                currentState = IDLE;
-                lastActivityTime = millis();
-                drawIdle();
                 return;
             }
             if (c == 'l' || c == 'L') {

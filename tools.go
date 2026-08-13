@@ -18,12 +18,32 @@ import (
 // notifyCardputerSent sends a log notification to the MCP client so that
 // CodeBuddy displays a message in its chat while waiting for the Cardputer
 // response. This gives the user a visible prompt on both screens.
+//
+// Uses LoggingLevelError because the stdio session's default minimum level is
+// "error" (level 4). Lower levels like "notice" (2) or "info" (1) are silently
+// filtered out by the MCP library before reaching the client. Using "error"
+// ensures the message always passes the filter, even though it's not actually
+// an error — it's an informational prompt that happens to need the highest
+// priority channel to be visible.
 func notifyCardputerSent(ctx context.Context, s *server.MCPServer, msg string) {
 	if s == nil {
 		return
 	}
-	notif := mcp.NewLoggingMessageNotification(mcp.LoggingLevelNotice, "ask-master", msg)
-	_ = s.SendLogMessageToClient(ctx, notif)
+	notif := mcp.NewLoggingMessageNotification(mcp.LoggingLevelError, "ask-master", msg)
+	if err := s.SendLogMessageToClient(ctx, notif); err != nil {
+		slog.Default().Info("notifyCardputerSent log failed", "error", err)
+	} else {
+		slog.Default().Info("notifyCardputerSent log sent", "msg", msg)
+	}
+
+	if err := s.SendNotificationToClient(ctx, "notifications/message", map[string]any{
+		"role":    "assistant",
+		"content": msg,
+	}); err != nil {
+		slog.Default().Info("notifyCardputerSent custom failed", "error", err)
+	} else {
+		slog.Default().Info("notifyCardputerSent custom sent")
+	}
 }
 
 // Payload length budget, in runes. The device wraps and scrolls text, so these

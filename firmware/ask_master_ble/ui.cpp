@@ -575,7 +575,7 @@ void drawSleepScreen() {
     initCanvasIfNeeded();
     canvas.fillSprite(UI_RGB_BG);
 
-    drawStatusBar(L("休眠", "SLEEP"), ACC_IDLE, true);
+    drawStatusBar(L("休眠", "SLEEP"), ACC_IDLE, false);
 
     useDisplayFont();
     canvas.setTextColor(cMid());
@@ -584,9 +584,9 @@ void drawSleepScreen() {
 
     useChromeFont();
     canvas.setTextColor(cDim());
-    canvas.drawString(L("按任意键唤醒", "any key to wake"), 120, UI_BODY_Y + 58);
+    canvas.drawString(L("等待蓝牙连接", "waiting for BLE"), 120, UI_BODY_Y + 58);
 
-    drawFooterDim(L("[S] 设备信息  [W] 唤醒  [L] 语言", "[S] Info  [W] Wake  [L] Lang"));
+    drawFooterDim(L("[S] 设备信息  [L] 语言", "[S] Info  [L] Lang"));
 
     canvas.pushSprite(0, 0);
 }
