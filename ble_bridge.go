@@ -421,6 +421,11 @@ func isASCII(b []byte) bool {
 	return true
 }
 
+// receive processes a reply line from the BLE device.
+// Supports both:
+//   - new protocol: {"cmd":"permission"/"input","id":"...","decision":"..."}
+//   - legacy text: "y"/"n"/"some text"
+// The new protocol extracts the text field; legacy passes through verbatim.
 func (b *BLEBridge) receive(line string) {
 	b.mu.Lock()
 	pq := b.current
@@ -434,6 +439,27 @@ func (b *BLEBridge) receive(line string) {
 	}
 
 	reply := strings.TrimSpace(line)
+
+	// 新协议格式：JSON cmd 对象
+	if strings.HasPrefix(reply, "{") {
+		var resp struct {
+			Cmd  string `json:"cmd"`
+			ID   string `json:"id"`
+			Text string `json:"text"`
+			Decision string `json:"decision"`
+			Option int    `json:"option"`
+		}
+		if err := json.Unmarshal([]byte(reply), &resp); err == nil && resp.Cmd != "" {
+			switch resp.Cmd {
+			case "permission":
+				reply = resp.Decision // "once" / "deny"
+			case "input":
+				reply = resp.Text // free text
+			}
+		}
+		// else: unrecognized JSON, pass through as-is
+	}
+
 	if pq.questionType == "choose" {
 		mapped, err := mapChooseReply(reply, pq.options)
 		if err != nil {

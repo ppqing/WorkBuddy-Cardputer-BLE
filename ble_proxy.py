@@ -28,7 +28,7 @@ import asyncio
 import json
 import sys
 
-DEVICE_NAME = "ask-master"
+DEVICE_NAME = "Claude AskMaster"
 RX_CHAR = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 TX_CHAR = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 

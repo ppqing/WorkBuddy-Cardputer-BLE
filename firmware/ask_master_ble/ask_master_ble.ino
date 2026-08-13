@@ -13,15 +13,18 @@ enum State {
     IDLE,
     RENDERING,
     WAITING_INPUT,
-    SENDING
+    SENDING,
+    PAIRING
 };
 
-static constexpr const char* APP_VERSION = "ask-master BLE v1.0.0";
-static constexpr const char* BLE_DEVICE_NAME = "ask-master";
+static constexpr const char* APP_VERSION = "Claude AskMaster v2.0.0";
+static constexpr const char* BLE_DEVICE_NAME = "Claude AskMaster";
 // One payload must fit here whole. UTF-8 CJK costs 3 bytes per character, so a
 // fully populated Chinese choose message (question + context + 6 options) needs
 // several KB; 1 KB used to overflow and drop the message.
 static constexpr size_t MAX_RX_BUFFER = 4096;
+// 当前活跃 prompt 的 ID（用于回复）
+static String currentPromptID;
 
 State currentState = SLEEP;
 char inputBuffer[81] = {0};
@@ -58,6 +61,10 @@ int maxScrollOffset = 0;
 static volatile bool bleJustConnected = false;
 static volatile bool bleJustDisconnected = false;
 
+// 配对状态
+static volatile bool displayPasskey = false;
+static volatile char passkeyBuffer[8] = {0};
+
 unsigned long lastActivityTime = 0;
 unsigned long lastIdleRedraw = 0;
 // IDLE 画面静止，低频重绘即可。过高频率的 pushSprite 会与
@@ -82,6 +89,8 @@ void renderCurrentScreen();
 void handleKeyboard();
 bool handleScrollKeys();
 void sendReply(const String& reply);
+void sendPermission(const String& id, const String& decision, int option);
+void sendInput(const String& id, const String& text);
 void clearCurrentPrompt();
 void drawIdle();
 void updateMaxScroll();
@@ -101,7 +110,7 @@ void setup() {
     delay(500);
     #endif
 
-    DBG("=== ask-master BLE boot ===");
+    DBG("=== ask-master BLE v2.0 boot ===");
 
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
@@ -137,6 +146,15 @@ void setup() {
 
 void loop() {
     M5Cardputer.update();
+
+    // 处理配对显示
+    if (displayPasskey) {
+        currentState = PAIRING;
+        drawSetupScreen(L("配对码: ", "Pairing: "), String((const char*)passkeyBuffer).c_str(), "");
+        M5Cardputer.Display.display();
+        displayPasskey = false;
+        return;
+    }
 
     // 处理 BLE 连接状态变化（从 core 0 回调转交到 core 1 执行）
     if (bleJustConnected) {
@@ -302,6 +320,15 @@ void handleBLEInput() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 新协议解析：支持官方 Claude Hardware Buddy 协议 + 扩展
+//
+// 输入格式：
+//   {"type":"prompt","prompt":{"id":"ask_xxx","tool":"confirm","hint":"...",
+//     "context":"...","options":[...],"input":true,"escalated":true}}
+//   或心跳快照（无 prompt 字段）：显示状态摘要后回到 IDLE
+//   或命令对象：{"cmd":"status"} / {"cmd":"name","name":"..."} / ...
+// ---------------------------------------------------------------------------
 void processLine(const String& message) {
     if (currentState == SENDING) {
         return;
@@ -314,15 +341,88 @@ void processLine(const String& message) {
         return;
     }
 
+    // ---- 命令处理 ----
+    if (doc["cmd"].is<const char*>()) {
+        String cmd = doc["cmd"].as<String>();
+        DBG("CMD: " + cmd);
+
+        if (cmd == "status") {
+            // 回复 status ack
+            String ack = "{\"ack\":\"status\",\"ok\":true}";
+            M5Cardputer.BLE.send(ack);
+            return;
+        }
+        if (cmd == "name") {
+            String ack = "{\"ack\":\"name\",\"ok\":true}";
+            M5Cardputer.BLE.send(ack);
+            return;
+        }
+        if (cmd == "owner") {
+            String ack = "{\"ack\":\"owner\",\"ok\":true}";
+            M5Cardputer.BLE.send(ack);
+            return;
+        }
+        if (cmd == "unpair") {
+            // 清除绑定（NimBLE 自动管理）
+            String ack = "{\"ack\":\"unpair\",\"ok\":true}";
+            M5Cardputer.BLE.send(ack);
+            return;
+        }
+        return;
+    }
+
+    // ---- 心跳快照（无 prompt 字段） ----
+    if (!doc["prompt"].is<JsonObject>() && doc["total"].is<int>()) {
+        // 纯心跳：显示状态摘要后回到 IDLE
+        if (doc["waiting"].as<int>() > 0) {
+            String msg = doc["msg"].as<String>();
+            // 如果有等待，短暂显示提醒
+            if (msg.length() > 0) {
+                drawIdleScreen(APP_VERSION, msg.c_str(), true);
+                delay(500);
+            }
+        }
+        if (currentState != WAITING_INPUT && currentState != SENDING) {
+            currentState = IDLE;
+        }
+        return;
+    }
+
+    // ---- prompt 处理（官方协议核心） ----
+    JsonObject prompt = doc["prompt"];
+    if (prompt.isNull()) {
+        return;
+    }
+
     clearCurrentPrompt();
-    currentType = doc["type"].as<String>();
-    currentQuestion = doc["question"].as<String>();
-    currentContext = doc["context"].as<String>();
+
+    // 提取扩展字段
+    currentPromptID = prompt["id"].as<String>();
+
+    // 映射类型
+    String tool = prompt["tool"].as<String>();
+    bool hasInput = prompt["input"].as<bool>();
+    bool hasOptions = prompt["options"].is<JsonArray>() && prompt["options"].size() > 0;
+    bool isEscalated = prompt["escalated"].as<bool>();
+
+    if (isEscalated) {
+        currentType = "escalate";
+    } else if (hasInput) {
+        currentType = "ask";
+    } else if (hasOptions) {
+        currentType = "choose";
+    } else {
+        currentType = "confirm";
+    }
+
+    currentQuestion = prompt["hint"].as<String>();
+    currentContext = prompt["context"].as<String>();
     scrollOffset = 0;
     maxScrollOffset = 0;
 
-    if (currentType == "choose") {
-        JsonArray opts = doc["options"].as<JsonArray>();
+    // 提取选项
+    if (hasOptions) {
+        JsonArray opts = prompt["options"].as<JsonArray>();
         currentOptionCount = 0;
         for (JsonVariant option : opts) {
             if (currentOptionCount >= 6) {
@@ -353,7 +453,6 @@ void processLine(const String& message) {
 void renderCurrentScreen() {
     if (currentType == "ask") {
         if (ime.pinyinMode() && ime.composing()[0]) {
-            // Build a space-separated candidate string for the UI.
             char candStr[128];
             candStr[0] = '\0';
             for (int i = 0; i < ime.candidateCount() && i < 9; i++) {
@@ -470,7 +569,8 @@ void handleKeyboard() {
         }
 
         if (needSend) {
-            sendReply(String(ime.text()));
+            // 新协议：以 cmd:input 发送自由文本
+            sendInput(currentPromptID, String(ime.text()));
             return;
         }
         if (needRedraw) {
@@ -482,11 +582,12 @@ void handleKeyboard() {
     if (currentType == "confirm") {
         for (char c : status.word) {
             if (c == 'y' || c == 'Y') {
-                sendReply("y");
+                // 新协议：发送 permission 命令
+                sendPermission(currentPromptID, "once", 0);
                 return;
             }
             if (c == 'n' || c == 'N') {
-                sendReply("n");
+                sendPermission(currentPromptID, "deny", 0);
                 return;
             }
         }
@@ -498,7 +599,8 @@ void handleKeyboard() {
             if (c >= '1' && c <= '6') {
                 int choice = c - '0';
                 if (choice <= currentOptionCount) {
-                    sendReply(String(c));
+                    // 新协议：发送 permission 命令 + option 扩展
+                    sendPermission(currentPromptID, "once", choice);
                     return;
                 }
             }
@@ -506,18 +608,73 @@ void handleKeyboard() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 新协议回复
+// ---------------------------------------------------------------------------
+
+// 发送 permission 决定（官方命令 + 扩展）
+void sendPermission(const String& id, const String& decision, int option) {
+    currentState = SENDING;
+    String json;
+    if (option > 0) {
+        json = "{\"cmd\":\"permission\",\"id\":\"" + id + "\",\"decision\":\"" + decision + "\",\"option\":" + String(option) + "}";
+    } else {
+        json = "{\"cmd\":\"permission\",\"id\":\"" + id + "\",\"decision\":\"" + decision + "\"}";
+    }
+    json += "\n";
+    M5Cardputer.BLE.send(json);
+    M5Cardputer.Speaker.tone(BEEP_ANSWER_FREQ, BEEP_ANSWER_DURATION_MS);
+
+    DBG("TX: " + json);
+    clearCurrentPrompt();
+    delay(500);
+    transitionToSleep();
+}
+
+// 发送自由文本（扩展命令）
+void sendInput(const String& id, const String& text) {
+    currentState = SENDING;
+    // 转义 JSON 特殊字符
+    String escaped = text;
+    escaped.replace("\\", "\\\\");
+    escaped.replace("\"", "\\\"");
+    escaped.replace("\n", "\\n");
+    escaped.replace("\r", "\\r");
+    escaped.replace("\t", "\\t");
+
+    String json = "{\"cmd\":\"input\",\"id\":\"" + id + "\",\"text\":\"" + escaped + "\"}\n";
+    M5Cardputer.BLE.send(json);
+    M5Cardputer.Speaker.tone(BEEP_ANSWER_FREQ, BEEP_ANSWER_DURATION_MS);
+
+    DBG("TX: " + json);
+    clearCurrentPrompt();
+    delay(500);
+    transitionToSleep();
+}
+
+// 兼容旧协议：裸文本回复（仍保留用于确认 @ 旧版 daemon）
 void sendReply(const String& reply) {
+    // 如果有 prompt ID，用新协议发送
+    if (currentPromptID.length() > 0) {
+        if (currentType == "confirm") {
+            sendPermission(currentPromptID, (reply == "y" || reply == "Y") ? "once" : "deny", 0);
+        } else {
+            sendInput(currentPromptID, reply);
+        }
+        return;
+    }
+    // 旧协议回退
     currentState = SENDING;
     String line = reply + "\n";
     M5Cardputer.BLE.send(line);
     M5Cardputer.Speaker.tone(BEEP_ANSWER_FREQ, BEEP_ANSWER_DURATION_MS);
-
     clearCurrentPrompt();
     delay(500);
     transitionToSleep();
 }
 
 void clearCurrentPrompt() {
+    currentPromptID = "";
     inputBuffer[0] = '\0';
     inputLength = 0;
     ime.reset();

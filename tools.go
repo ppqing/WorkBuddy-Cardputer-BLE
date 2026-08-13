@@ -18,13 +18,6 @@ import (
 // notifyCardputerSent sends a log notification to the MCP client so that
 // CodeBuddy displays a message in its chat while waiting for the Cardputer
 // response. This gives the user a visible prompt on both screens.
-//
-// Uses LoggingLevelError because the stdio session's default minimum level is
-// "error" (level 4). Lower levels like "notice" (2) or "info" (1) are silently
-// filtered out by the MCP library before reaching the client. Using "error"
-// ensures the message always passes the filter, even though it's not actually
-// an error — it's an informational prompt that happens to need the highest
-// priority channel to be visible.
 func notifyCardputerSent(ctx context.Context, s *server.MCPServer, msg string) {
 	if s == nil {
 		return
@@ -32,8 +25,6 @@ func notifyCardputerSent(ctx context.Context, s *server.MCPServer, msg string) {
 	notif := mcp.NewLoggingMessageNotification(mcp.LoggingLevelError, "ask-master", msg)
 	if err := s.SendLogMessageToClient(ctx, notif); err != nil {
 		slog.Default().Info("notifyCardputerSent log failed", "error", err)
-	} else {
-		slog.Default().Info("notifyCardputerSent log sent", "msg", msg)
 	}
 
 	if err := s.SendNotificationToClient(ctx, "notifications/message", map[string]any{
@@ -41,29 +32,28 @@ func notifyCardputerSent(ctx context.Context, s *server.MCPServer, msg string) {
 		"content": msg,
 	}); err != nil {
 		slog.Default().Info("notifyCardputerSent custom failed", "error", err)
-	} else {
-		slog.Default().Info("notifyCardputerSent custom sent")
 	}
 }
 
-// Payload length budget, in runes. The device wraps and scrolls text, so these
-// limits only exist to bound one BLE message: the firmware's receive buffer is
-// 4 KB and CJK characters cost 3 bytes each in UTF-8, which keeps the worst
-// case (question + context + 6 options) comfortably inside it.
-//
-// Text over the limit is cut with an ellipsis so the human can see that
-// something was dropped rather than reading a sentence that stops mid-word.
 const (
 	maxQuestionRunes = 200
 	maxContextRunes  = 120
 	maxOptionRunes   = 80
 )
 
+// ---------------------------------------------------------------------------
+// 官方 Claude Hardware Buddy 协议 + 扩展
+//
+// 每个工具生成一个 prompt 对象，通过 bridge.SendAndWait 发送到设备。
+// 设备回复后由 bridge 解析返回文本。
+// ---------------------------------------------------------------------------
+
 func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
+	// ---- ask-human: 自由文本输入（input:true 扩展） ----
 	s.AddTool(
 		mcp.NewTool(
 			"ask-human",
@@ -78,11 +68,7 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
-			payload, err := jsonPayload(map[string]any{
-				"type":     "ask",
-				"question": truncate.StringWithEllipsis(question, maxQuestionRunes),
-				"context":  truncate.StringWithEllipsis(req.GetString("context", ""), maxContextRunes),
-			})
+			payload, err := newPromptPayload("ask-human", question, req.GetString("context", ""), nil, true)
 			if err != nil {
 				logger.Error("marshal ask-human payload failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
@@ -92,21 +78,18 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			reply, err := bridge.SendAndWait(payload, "ask", nil, toolTimeout(req))
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) {
-					logger.Warn("ask-human timed out", "error", err)
-					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] Nobody answered in time. Please answer manually: %s", question)), nil
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] Please answer manually: %s", question)), nil
 				}
 				if isBridgeOffline(bridge, err) {
-					logger.Warn("ask-human offline fallback", "error", err)
 					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER OFFLINE] Please answer manually: %s", question)), nil
 				}
-				logger.Error("ask-human failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-
 			return mcp.NewToolResultText(reply), nil
 		},
 	)
 
+	// ---- confirm: 二元确认（官方兼容） ----
 	s.AddTool(
 		mcp.NewTool(
 			"confirm",
@@ -121,11 +104,7 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
-			payload, err := jsonPayload(map[string]any{
-				"type":     "confirm",
-				"question": truncate.StringWithEllipsis(statement, maxQuestionRunes),
-				"context":  truncate.StringWithEllipsis(req.GetString("consequence", ""), maxContextRunes),
-			})
+			payload, err := newPromptPayload("confirm", statement, req.GetString("consequence", ""), nil, false)
 			if err != nil {
 				logger.Error("marshal confirm payload failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
@@ -134,28 +113,19 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			notifyCardputerSent(ctx, s, fmt.Sprintf("等待 Cardputer 确认: %s", statement))
 			reply, err := bridge.SendAndWait(payload, "confirm", nil, toolTimeout(req))
 			if err != nil {
-				// A timeout and an offline device are NOT a human "no": keep them
-				// distinguishable from a real rejection.
 				if errors.Is(err, context.DeadlineExceeded) {
-					logger.Warn("confirm timed out", "error", err)
-					return mcp.NewToolResultText(fmt.Sprintf(
-						"[CARDPUTER TIMEOUT] Nobody answered in time; treat as NOT confirmed (this is not a human \"no\"): %s",
-						statement)), nil
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] NOT confirmed: %s", statement)), nil
 				}
 				if isBridgeOffline(bridge, err) {
-					logger.Warn("confirm offline fallback", "error", err)
-					return mcp.NewToolResultText(fmt.Sprintf(
-						"[CARDPUTER OFFLINE] Device unreachable; treat as NOT confirmed (this is not a human \"no\"): %s",
-						statement)), nil
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER OFFLINE] NOT confirmed: %s", statement)), nil
 				}
-				logger.Error("confirm failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
 			switch strings.ToLower(strings.TrimSpace(reply)) {
-			case "y", "true":
+			case "y", "true", "once", "approve":
 				reply = "true"
-			case "n", "false":
+			case "n", "false", "deny":
 				reply = "false"
 			}
 
@@ -163,6 +133,7 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 		},
 	)
 
+	// ---- choose: 多选（options 扩展） ----
 	s.AddTool(
 		mcp.NewTool(
 			"choose",
@@ -190,12 +161,7 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 				truncatedOptions = append(truncatedOptions, truncate.StringWithEllipsis(option, maxOptionRunes))
 			}
 
-			payload, err := jsonPayload(map[string]any{
-				"type":     "choose",
-				"question": truncate.StringWithEllipsis(question, maxQuestionRunes),
-				"context":  truncate.StringWithEllipsis(req.GetString("context", ""), maxContextRunes),
-				"options":  truncatedOptions,
-			})
+			payload, err := newPromptPayload("choose", question, req.GetString("context", ""), truncatedOptions, false)
 			if err != nil {
 				logger.Error("marshal choose payload failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
@@ -204,31 +170,23 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			notifyCardputerSent(ctx, s, fmt.Sprintf("等待 Cardputer 选择: %s", question))
 			reply, err := bridge.SendAndWait(payload, "choose", truncatedOptions, toolTimeout(req))
 			if err != nil {
-				// Never silently pass off the first option as a human choice.
 				if errors.Is(err, context.DeadlineExceeded) {
-					logger.Warn("choose timed out", "error", err)
-					return mcp.NewToolResultText(fmt.Sprintf(
-						"[CARDPUTER TIMEOUT] Nobody chose in time; no option was selected: %s",
-						question)), nil
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] No option selected: %s", question)), nil
 				}
 				if isBridgeOffline(bridge, err) {
-					logger.Warn("choose offline fallback", "error", err)
-					return mcp.NewToolResultText(fmt.Sprintf(
-						"[CARDPUTER OFFLINE] Device unreachable; no option was selected: %s",
-						question)), nil
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER OFFLINE] No option selected: %s", question)), nil
 				}
-				logger.Error("choose failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-
 			return mcp.NewToolResultText(reply), nil
 		},
 	)
 
+	// ---- escalate-to-human: 紧急提示（escalated 扩展） ----
 	s.AddTool(
 		mcp.NewTool(
 			"escalate-to-human",
-			mcp.WithDescription("Escalate a question to the human via the Cardputer device. Use ONLY when: (1) You already asked in chat and got no response after 2+ minutes, OR (2) The question is urgent and needs immediate attention. This tool is a 'louder' version of ask-human designed to grab attention."),
+			mcp.WithDescription("Escalate a question to the human via the Cardputer device. Use ONLY when: (1) You already asked in chat and got no response after 2+ minutes, OR (2) The question is urgent and needs immediate attention."),
 			mcp.WithString("question", mcp.Required(), mcp.Description("Question to ask.")),
 			mcp.WithString("context", mcp.Description("Additional context.")),
 			mcp.WithInteger("chat_wait_time_seconds", mcp.Description("How many seconds you waited in chat before escalating")),
@@ -242,12 +200,7 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
-			payload, err := jsonPayload(map[string]any{
-				"type":      "escalate",
-				"question":  truncate.StringWithEllipsis(question, maxQuestionRunes),
-				"context":   truncate.StringWithEllipsis(req.GetString("context", ""), maxContextRunes),
-				"escalated": true,
-			})
+			payload, err := newPromptPayload("escalate", question, req.GetString("context", ""), nil, true)
 			if err != nil {
 				logger.Error("marshal escalate-to-human payload failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
@@ -257,20 +210,53 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			reply, err := bridge.SendAndWait(payload, "escalate", nil, toolTimeout(req))
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) {
-					logger.Warn("escalate-to-human timed out", "error", err)
-					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] Nobody answered in time. Please answer manually: %s", question)), nil
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] Please answer manually: %s", question)), nil
 				}
 				if isBridgeOffline(bridge, err) {
-					logger.Warn("escalate-to-human offline fallback", "error", err)
 					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER OFFLINE] Please answer manually: %s", question)), nil
 				}
-				logger.Error("escalate-to-human failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-
 			return mcp.NewToolResultText(reply), nil
 		},
 	)
+}
+
+// newPromptPayload 生成官方协议的 prompt 对象（含扩展字段）。
+// tool 参数用于 device 渲染时显示工具名。
+func newPromptPayload(tool, question, context string, options []string, input bool) (string, error) {
+	// 生成唯一 id（使用时间戳，简单可靠）
+	promptID := fmt.Sprintf("ask_%d", time.Now().UnixMilli())
+
+	data := map[string]any{
+		"type": "prompt",
+		"prompt": map[string]any{
+			"id":      promptID,
+			"tool":    tool,
+			"hint":    truncate.StringWithEllipsis(question, maxQuestionRunes),
+			"context": truncate.StringWithEllipsis(context, maxContextRunes),
+		},
+	}
+
+	// 扩展字段
+	if len(options) > 0 {
+		pm := data["prompt"].(map[string]any)
+		pm["options"] = options
+	}
+	if input {
+		pm := data["prompt"].(map[string]any)
+		pm["input"] = true
+	}
+	if tool == "escalate" {
+		pm := data["prompt"].(map[string]any)
+		pm["escalated"] = true
+	}
+
+	b, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("marshal prompt: %w", err)
+	}
+	return string(b), nil
 }
 
 func toolTimeout(req mcp.CallToolRequest) time.Duration {
