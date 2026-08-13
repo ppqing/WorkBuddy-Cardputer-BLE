@@ -837,6 +837,35 @@ void drawChooseScreen(const char* question, const char* context, const String op
 }
 
 // ============================================================================
+// RECORDING（P1 语音输入）
+// ============================================================================
+void drawRecordingScreen(unsigned long elapsedMs) {
+    initCanvasIfNeeded();
+    canvas.fillSprite(UI_RGB_BG);
+
+    drawStatusBar(L("语音输入", "VOICE"), ACC_ESCALATE, false);
+
+    int cx = 120;
+    int cy = 54;
+
+    // 红色录音指示圆点
+    canvas.fillCircle(cx, cy, 8, TFT_RED);
+    canvas.drawCircle(cx, cy, 12, TFT_RED);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lu.%02lu s", elapsedMs / 1000, (elapsedMs % 1000) / 10);
+    useChromeFont();
+    canvas.setTextColor(UI_RGB_FG);
+    canvas.setTextDatum(middle_center);
+    canvas.drawString(buf, cx, cy + 28);
+    canvas.drawString(L("说话中…", "Recording…"), cx, cy + 46);
+
+    drawFooter3(L("松开 Ctrl 发送", "release Ctrl"), "", "30s max", ACC_ESCALATE);
+
+    canvas.pushSprite(0, 0);
+}
+
+// ============================================================================
 // SETUP
 // ============================================================================
 void drawSetupScreen(const char* label, const char* context, const char* inputBuffer) {

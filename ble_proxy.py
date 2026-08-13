@@ -17,16 +17,33 @@ Protocol (line-delimited JSON on stdin/stdout):
 The Cardputer reply protocol mirrors ask-master's WebSocket transport: the
 device answers with a single line terminated by '\\n'.
 
-The proxy reconnects indefinitely: the Cardputer stops advertising while it is
-connected and resumes advertising after a disconnect (NimBLE default), so a
-device reset or a dropped link must not kill this process.
+Voice (P1): while the device shows an ask/escalate prompt, holding Ctrl records
+the built-in MEMS mic (ES8311). Audio is streamed as IMA-ADPCM in JSON frames:
 
-Requires: pip install bleak
+    {"evt":"audio","seq":N,"data":"<base64 ADPCM>"}
+    {"evt":"audio_end","seq":N,"len":<PCM samples>,"rate":16000}
+
+On audio_end the proxy decodes ADPCM back to 16 kHz mono PCM, optionally
+transcribes it with faster-whisper, and injects the result back into the daemon
+as a normal input reply:
+
+    {"cmd":"input","id":"<prompt id>","text":"<transcribed text>"}
+
+If faster-whisper is not installed the audio is saved as a .wav file and a
+fallback text reply points at it.
+
+Requires: pip install bleak  (voice: pip install faster-whisper)
 """
 
 import asyncio
+import base64
 import json
+import os
+import struct
 import sys
+import tempfile
+import time
+import wave
 
 DEVICE_NAME = "Claude AskMaster"
 RX_CHAR = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -34,6 +51,90 @@ TX_CHAR = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 SCAN_TIMEOUT = 10.0
 RETRY_DELAY = 2.0
+
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_DIR = os.path.join(tempfile.gettempdir(), "ask-master-audio")
+
+# ---------------------------------------------------------------------------
+# IMA-ADPCM decode (mirror of the firmware encoder in audio.cpp)
+# ---------------------------------------------------------------------------
+
+IMA_STEP = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+    34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+    724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
+    3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+]
+IMA_INDEX = [-1, -1, -1, -1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+
+
+def adpcm_decode(data):
+    """Decode packed IMA-ADPCM (2 nibbles/byte, first sample in high nibble)
+    back into a list of int16 samples."""
+    out = []
+    pred = 0
+    idx = 0
+    for b in data:
+        for nib in ((b >> 4) & 0xF, b & 0xF):
+            step = IMA_STEP[idx]
+            delta = step >> 3
+            if nib & 4:
+                delta += step
+            if nib & 2:
+                delta += step >> 1
+            if nib & 1:
+                delta += step >> 2
+            if nib & 8:
+                pred -= delta
+            else:
+                pred += delta
+            pred = max(-32768, min(32767, pred))
+            idx += IMA_INDEX[nib & 7]
+            idx = max(0, min(88, idx))
+            out.append(pred)
+    return out
+
+
+def write_wav(path, samples, rate=AUDIO_SAMPLE_RATE):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(struct.pack("<%dh" % len(samples), *samples))
+
+
+# ---------------------------------------------------------------------------
+# faster-whisper transcription (lazy, cached model)
+# ---------------------------------------------------------------------------
+
+_whisper_model = None
+
+
+def transcribe(path):
+    """Transcribe a wav file. Returns text, or None if whisper is unavailable."""
+    global _whisper_model
+    try:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+
+            _whisper_model = WhisperModel(
+                "tiny", device="cpu", compute_type="int8"
+            )
+        segments, _info = _whisper_model.transcribe(
+            path, language=None, beam_size=1, vad_filter=True
+        )
+        return "".join(s.text for s in segments).strip()
+    except Exception as e:
+        emit({"event": "log", "msg": "whisper error: %r" % e})
+        return None
+
+
+# ---------------------------------------------------------------------------
+# stdio plumbing
+# ---------------------------------------------------------------------------
 
 
 class _Shutdown(Exception):
@@ -80,7 +181,7 @@ async def stdin_reader(cmd_q):
         await cmd_q.put(msg)
 
 
-async def pump(client, cmd_q):
+async def pump(client, cmd_q, state):
     """Forward queued commands to the device until the link drops."""
     while client.is_connected:
         try:
@@ -92,12 +193,43 @@ async def pump(client, cmd_q):
         if msg.get("cmd") != "send":
             continue
         payload = msg.get("payload", "")
+        # Track the latest prompt id so voice replies can reference it.
+        try:
+            p = json.loads(payload)
+            pid = (p.get("prompt") or {}).get("id")
+            if pid:
+                state["prompt_id"] = pid
+        except Exception:
+            pass
         try:
             # The device splits incoming messages on '\n'; the newline is required.
             await client.write_gatt_char(RX_CHAR, (payload + "\n").encode("utf-8"))
         except Exception as e:
             emit({"event": "log", "msg": "write error: %r" % e})
             return  # treat write failure as a dropped link
+
+
+async def process_audio_end(adpcm, meta, state):
+    """Decode the recorded ADPCM, save it, transcribe, and reply as input."""
+    samples = adpcm_decode(adpcm)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    wav_path = os.path.join(AUDIO_DIR, "voice-%s.wav" % ts)
+    write_wav(wav_path, samples)
+    emit({"event": "log", "msg": "voice captured: %d samples -> %s" % (len(samples), wav_path)})
+
+    pid = state.get("prompt_id") or ""
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(None, transcribe, wav_path)
+
+    if text:
+        reply = {"cmd": "input", "id": pid, "text": text}
+    else:
+        reply = {
+            "cmd": "input",
+            "id": pid,
+            "text": "[voice: %s] (faster-whisper 未安装，未转写)" % wav_path.replace("\\", "/"),
+        }
+    emit({"event": "recv", "line": json.dumps(reply, ensure_ascii=False)})
 
 
 async def main():
@@ -113,6 +245,7 @@ async def main():
 
     cmd_q = asyncio.Queue()
     reader = asyncio.create_task(stdin_reader(cmd_q))
+    state = {"prompt_id": ""}
 
     try:
         while True:
@@ -136,20 +269,37 @@ async def main():
             emit({"event": "log", "msg": "found %s" % device.address})
 
             rxbuf = b""
+            audio_buf = bytearray()
 
             def on_notify(_sender, data):
-                nonlocal rxbuf
+                nonlocal rxbuf, audio_buf
                 rxbuf += data
                 while b"\n" in rxbuf:
                     line, rxbuf = rxbuf.split(b"\n", 1)
-                    emit({"event": "recv", "line": line.decode("utf-8", "replace")})
+                    s = line.decode("utf-8", "replace")
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        obj = None
+                    if obj and obj.get("evt") == "audio":
+                        try:
+                            audio_buf += base64.b64decode(obj.get("data", ""))
+                        except Exception:
+                            pass
+                        continue
+                    if obj and obj.get("evt") == "audio_end":
+                        payload = bytes(audio_buf)
+                        audio_buf = bytearray()
+                        asyncio.ensure_future(process_audio_end(payload, obj, state))
+                        continue
+                    emit({"event": "recv", "line": s})
 
             try:
                 async with BleakClient(device.address) as client:
                     # Subscribe before announcing the link so no reply is missed.
                     await client.start_notify(TX_CHAR, on_notify)
                     emit({"event": "connected", "connected": True})
-                    await pump(client, cmd_q)
+                    await pump(client, cmd_q, state)
             except _Shutdown:
                 emit({"event": "connected", "connected": False})
                 return

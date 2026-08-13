@@ -30,6 +30,9 @@ void drawConfirmScreen(const char* statement, const char* consequence, int scrol
 void drawChooseScreen(const char* question, const char* context, const String options[], int optionCount, int scrollY);
 void drawSleepScreen();
 
+// P1 语音输入：按住 PTT 说话时的全屏录音界面（红点 + 时长）
+void drawRecordingScreen(unsigned long elapsedMs);
+
 // Ask/escalate screens with an active pinyin IME. `composing` is the raw pinyin
 // being typed (e.g. "ni"), `cands` is a NUL-terminated UTF-8 string of candidate
 // hanzi shown as a numbered bar above the input row. When `composing` is empty

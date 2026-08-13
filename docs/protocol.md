@@ -123,13 +123,16 @@
 **方向：设备 → 桌面**，逐帧 base64，`\n` 行分隔：
 
 ```json
-{ "evt": "audio", "seq": 1, "fmt": "adpcm", "rate": 16000, "ch": 1, "d": "<base64>" }
-{ "evt": "audio_end", "seq": 12, "id": "req_y" }
+{ "evt": "audio", "seq": 1, "data": "<base64 ADPCM>" }
+{ "evt": "audio_end", "seq": 12, "len": 48000, "rate": 16000 }
 ```
 
-- 仅在 `prompt.input == true` 且用户按住说话键（PTT）时发送；
-- 16kHz / 16-bit / mono，IMA-ADPCM 4:1 压缩；
-- PC 端收到 `audio_end` 后转写（faster-whisper 或云 ASR），文本作为 `input` 回复提交给 agent；
+- 仅在 `prompt.input == true`（`ask` / `escalate` 界面）且用户按住 PTT 键（**Ctrl**）时发送；
+- 16kHz / 16-bit / mono，IMA-ADPCM 4:1 压缩；每帧 512 个 PCM 采样（32ms），`data` 为 256 字节 ADPCM 的 base64；
+- IMA 打包：每 2 个 4-bit code 合成 1 字节，**高 4 位为第一个采样**（`(c1 << 4) | c2`），解码器按相同顺序还原；
+- 松开 PTT 发送 `audio_end`（`len` = 本次 PCM 总采样数，`rate` 恒为 16000），上限 30s；
+- PC 端（`ble_proxy.py`）收到 `audio_end` 后：ADPCM 解码 → 写临时 WAV → faster-whisper 转写（可选）→ 文本作为 `{"cmd":"input","id":"<最近 prompt id>","text":"..."}` 回复提交给 agent；
+- 未安装 faster-whisper 时，WAV 保存至系统临时目录 `ask-master-audio/`，并以指向文件的提示文本作为回复；
 - 官方桌面忽略 `evt` 消息，不影响兼容。
 
 ## 8. 加密与配对（官方安全机制）

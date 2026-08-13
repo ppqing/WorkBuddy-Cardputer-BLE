@@ -4,6 +4,7 @@
 #include "config.h"
 #include "ui.h"
 #include "pinyin_ime.h"
+#include "audio.h"
 #include <ArduinoJson.h>
 
 #define DEBUG_SERIAL
@@ -17,7 +18,7 @@ enum State {
     PAIRING
 };
 
-static constexpr const char* APP_VERSION = "Claude AskMaster v2.0.0";
+static constexpr const char* APP_VERSION = "Claude AskMaster v2.1.0";
 static constexpr const char* BLE_DEVICE_NAME = "Claude AskMaster";
 // One payload must fit here whole. UTF-8 CJK costs 3 bytes per character, so a
 // fully populated Chinese choose message (question + context + 6 options) needs
@@ -169,6 +170,29 @@ void loop() {
     }
 
     handleBLEInput();
+
+    // P1 语音输入：WAITING_INPUT(ask/escalate) 状态下按住 Ctrl 说话，
+    // 松开 Ctrl 结束录音并发送 audio_end（PC 端转写后回 input 回复）。
+    audioTick();  // 未录音时是 no-op
+
+    if (currentState == WAITING_INPUT &&
+        (currentType == "ask" || currentType == "escalate")) {
+        Keyboard_Class::KeysState kst = M5Cardputer.Keyboard.keysState();
+        if (kst.ctrl) {
+            if (!audioCapturing()) {
+                audioBeginCapture();
+            }
+            drawRecordingScreen(audioCapturedMillis());
+            yield();
+            return;
+        }
+    }
+    if (audioCapturing()) {
+        // Ctrl 已松开：结束本次录音
+        audioEndCapture();
+        transitionToSleep();
+        return;
+    }
 
     if (currentState == IDLE) {
         if (millis() - lastIdleRedraw > IDLE_REDRAW_MS) {
