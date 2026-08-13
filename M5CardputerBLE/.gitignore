@@ -1,0 +1,16 @@
+# 构建产物（保留 firmware/ 下的交付固件）
+/build/
+/.pio/
+/dist/
+
+# 交付固件（bootloader / partitions / firmware 三个 bin）需要入库
+!firmware/*.bin
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log

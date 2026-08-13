@@ -291,6 +291,17 @@ Output: `ask-master-cardputer.bin`.
 Press **S** on the idle screen to re-enter setup at any time.
 </details>
 
+## BLE UART library (`M5CardputerBLE`)
+
+[`M5CardputerBLE/`](M5CardputerBLE/) is a **BLE-adapted version** of the official [M5Cardputer](https://github.com/m5stack/M5Cardputer) driver library (MIT). It stays API-compatible with the official library (same `M5Cardputer.h`, class and member names) and adds a **BLE UART data channel** (Nordic UART Service) for direct phone ↔ Cardputer communication:
+
+- Phone → Cardputer: write to the RX characteristic (`write` / `write-without-response`)
+- Cardputer → Phone: notify on the TX characteristic
+- MTU-based chunking, 1 KB ring buffer, connection / receive callbacks
+- Compiles on ESP32 core 2.x (NimBLE-Arduino 1.4.x) and 3.x (NimBLE-Arduino 2.x)
+
+Quick start: install as an Arduino library (remove the original `M5Cardputer` library first to avoid header conflicts), then flash `examples/Basic/bleUart/bleUart.ino`. Ready-to-flash firmware lives under `M5CardputerBLE/firmware/`. See [`M5CardputerBLE/README.md`](M5CardputerBLE/README.md) for the full API reference and phone-side pairing guide.
+
 ## Development
 
 ```bash

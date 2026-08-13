@@ -1,0 +1,26 @@
+{
+  "name": "M5CardputerBLE",
+  "description": "BLE UART (Nordic UART Service) data channel for M5Cardputer / M5Cardputer-ADV. A drop-in BLE-adapted version of the M5Cardputer driver library.",
+  "keywords": "M5GFX,M5Stack,M5Cardputer,M5Cardputer-ADV,BLE,UART,NUS,NimBLE",
+  "authors": {
+    "name": "M5CardputerBLE contributors",
+    "url": "https://github.com/m5stack/M5Cardputer"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m5stack/M5Cardputer.git"
+  },
+  "version": "1.0.0",
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": [
+    "espressif32"
+  ],
+  "headers": "M5Cardputer.h",
+  "dependencies": {
+    "M5Unified": "*",
+    "M5GFX": "*",
+    "h2zero/NimBLE-Arduino": "*"
+  }
+}

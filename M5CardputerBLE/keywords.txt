@@ -1,0 +1,32 @@
+#######################################
+# Syntax Coloring Map For M5CardputerBLE
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+BLE_Class	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+begin	KEYWORD2
+end	KEYWORD2
+connected	KEYWORD2
+initialized	KEYWORD2
+setRecvCallback	KEYWORD2
+setConnectionCallback	KEYWORD2
+send	KEYWORD2
+sendLine	KEYWORD2
+available	KEYWORD2
+read	KEYWORD2
+readBytes	KEYWORD2
+readString	KEYWORD2
+flushRx	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+SERVICE_UUID	LITERAL1
+RX_CHAR_UUID	LITERAL1
+TX_CHAR_UUID	LITERAL1
