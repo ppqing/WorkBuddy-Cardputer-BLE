@@ -33,8 +33,8 @@ func main() {
 		logger.Error("failed to write lock file", "error", err)
 		os.Exit(1)
 	}
-	// Only the process that actually owns the socket may clean these up,
-	// otherwise a racing loser would unlink the winner's socket.
+	// Only the process that actually owns the daemon may clean these up,
+	// otherwise a racing loser would remove the winner's lock file.
 	ownsDaemonState := true
 	defer func() {
 		if ownsDaemonState {
@@ -70,7 +70,7 @@ func main() {
 
 	daemon := NewDaemon(bridge, logger)
 	if err := daemon.Start(); err != nil {
-		// Another process won the race to own the socket. Release our device
+		// Another process won the race to own the daemon. Release our device
 		// connection and proxy stdio to that daemon instead.
 		if errors.Is(err, errDaemonAlreadyRunning) {
 			logger.Info("another daemon won the startup race, running in client mode")
@@ -87,7 +87,7 @@ func main() {
 		logger.Error("daemon failed", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("daemon started", "socket", socketPath)
+	logger.Info("daemon started", "addr", daemonAddr)
 
 	s := server.NewMCPServer("ask-master", version,
 		server.WithToolCapabilities(true),

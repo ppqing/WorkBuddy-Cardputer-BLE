@@ -14,14 +14,21 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-var (
-	socketPath = resolveStateFile("ask-master.sock")
-	lockFile   = resolveStateFile("ask-master.lock")
-)
+// daemonAddr is the fixed localhost address for the daemon's TCP listener.
+//
+// A fixed port mirrors the original Unix-socket design: if the port is
+// already in use, another daemon is running and the new process falls back
+// to client mode. TCP localhost is used instead of Unix domain sockets
+// because Go's Unix socket support on Windows is unreliable — the path
+// semantics differ, os.FindProcess always succeeds (so PID liveness checks
+// are broken), and /tmp does not exist. TCP localhost works identically on
+// all platforms with zero platform-specific code.
+const daemonAddr = "127.0.0.1:51937"
+
+var lockFile = resolveStateFile("ask-master.lock")
 
 // resolveStateFile returns a per-user path for runtime state files, falling
-// back to /tmp only if a per-user directory is not available. This avoids
-// the historical /tmp/ask-master.sock collision on multi-user machines.
+// back to /tmp only if a per-user directory is not available.
 func resolveStateFile(name string) string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		base := filepath.Join(dir, "ask-master")
@@ -33,11 +40,11 @@ func resolveStateFile(name string) string {
 		_ = os.MkdirAll(base, 0700)
 		return filepath.Join(base, name)
 	}
-	return filepath.Join("/tmp", name)
+	return filepath.Join(os.TempDir(), name)
 }
 
 // Daemon runs the persistent bridge and accepts MCP client connections over
-// a Unix domain socket.
+// a TCP localhost socket.
 type Daemon struct {
 	bridge  Bridger
 	logger  *slog.Logger
@@ -59,21 +66,16 @@ func NewDaemon(bridge Bridger, logger *slog.Logger) *Daemon {
 var errDaemonAlreadyRunning = errors.New("another ask-master daemon is already running")
 
 func (d *Daemon) Start() error {
-	// Never delete the socket unconditionally: if two processes start at the
-	// same moment, doing so would unlink the winner's socket and leave two
-	// daemons fighting over the same Cardputer.
-	listener, err := net.Listen("unix", socketPath)
+	// Bind the fixed TCP port. If it's already taken, another daemon likely
+	// owns it — verify by dialing, then fall back to client mode.
+	listener, err := net.Listen("tcp", daemonAddr)
 	if err != nil {
-		// The socket exists. Probe it to tell a live daemon from a stale file.
-		if conn, derr := net.Dial("unix", socketPath); derr == nil {
+		if conn, derr := net.Dial("tcp", daemonAddr); derr == nil {
 			_ = conn.Close()
 			return errDaemonAlreadyRunning
 		}
-		_ = os.Remove(socketPath)
-		listener, err = net.Listen("unix", socketPath)
-		if err != nil {
-			return fmt.Errorf("listen unix socket: %w", err)
-		}
+		// Port is taken but we can't connect — another app is using it.
+		return fmt.Errorf("listen tcp %s: %w", daemonAddr, err)
 	}
 
 	d.mu.Lock()
@@ -123,21 +125,20 @@ func (d *Daemon) handleClient(conn net.Conn) {
 	)
 	RegisterTools(s, d.bridge, d.logger)
 
-	// Run JSON-RPC loop over the Unix socket
+	// Run JSON-RPC loop over the TCP connection
 	stdioServer := server.NewStdioServer(s)
-	
-	// Wrap the connection as stdin/stdout
+
 	ctx, cancel := contextWithCancel(d.logger)
 	defer cancel()
 
-	// Use a pipe approach: socket read -> stdin, stdout -> socket write
+	// Use a pipe approach: TCP read -> stdin, stdout -> TCP write
 	pr, pw := io.Pipe()
 	defer pr.Close()
 	defer pw.Close()
 
-	// Goroutine: read from socket, write to pipe (acts as stdin).
-	// When the socket reaches EOF (client disconnected), cancel the context
-	// so handleClient unblocks and returns instead of leaking the goroutines.
+	// Goroutine: read from TCP, write to pipe (acts as stdin).
+	// When the connection reaches EOF (client disconnected), cancel the
+	// context so handleClient unblocks and returns instead of leaking.
 	go func() {
 		defer pw.Close()
 		defer cancel()
@@ -152,20 +153,17 @@ func (d *Daemon) handleClient(conn net.Conn) {
 		}
 	}()
 
-	// Goroutine: read MCP responses from our stdout interceptor, write to socket
+	// Goroutine: read MCP responses, write to TCP
 	go func() {
-		// Create a custom writer that captures stdout
-		// For simplicity, we'll use the annotation filter approach
 		writer := &socketWriter{conn: conn}
 		_ = stdioServer.Listen(ctx, pr, writer)
 	}()
 
-	// Wait for connection to close or context cancellation
 	<-ctx.Done()
 	d.logger.Info("MCP client disconnected", "remote", conn.RemoteAddr())
 }
 
-// socketWriter implements io.Writer to send data back to the Unix socket
+// socketWriter implements io.Writer to send data back to the TCP connection
 type socketWriter struct {
 	conn net.Conn
 	mu   sync.Mutex
@@ -177,10 +175,10 @@ func (w *socketWriter) Write(p []byte) (n int, err error) {
 	return w.conn.Write(p)
 }
 
-// runClientMode connects to the daemon via Unix socket and proxies
+// runClientMode connects to the daemon via TCP and proxies
 // stdin/stdout bidirectionally.
 func runClientMode(logger *slog.Logger) error {
-	conn, err := net.Dial("unix", socketPath)
+	conn, err := net.Dial("tcp", daemonAddr)
 	if err != nil {
 		return fmt.Errorf("connect to daemon: %w", err)
 	}
@@ -191,13 +189,13 @@ func runClientMode(logger *slog.Logger) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// stdin -> socket
+	// stdin -> TCP
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(conn, os.Stdin)
 	}()
 
-	// socket -> stdout
+	// TCP -> stdout
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(os.Stdout, conn)
@@ -207,30 +205,13 @@ func runClientMode(logger *slog.Logger) error {
 	return nil
 }
 
-// isDaemonRunning checks if the daemon lock file exists and the process is alive.
+// isDaemonRunning checks if the daemon is alive by attempting to connect
+// to its TCP port. This is cross-platform: unlike os.FindProcess (which
+// always succeeds on Windows), a successful TCP dial guarantees the
+// daemon is listening.
 func isDaemonRunning() bool {
-	data, err := os.ReadFile(lockFile)
+	conn, err := net.Dial("tcp", daemonAddr)
 	if err != nil {
-		return false
-	}
-
-	var pid int
-	if _, err := fmt.Sscanf(string(data), "%d", &pid); err != nil {
-		_ = os.Remove(lockFile)
-		return false
-	}
-
-	// Check if process exists (Unix-specific)
-	_, err = os.FindProcess(pid)
-	if err != nil {
-		_ = os.Remove(lockFile)
-		return false
-	}
-
-	// Try to connect to the socket as verification
-	conn, err := net.Dial("unix", socketPath)
-	if err != nil {
-		// Stale lock
 		_ = os.Remove(lockFile)
 		return false
 	}
@@ -238,7 +219,7 @@ func isDaemonRunning() bool {
 	return true
 }
 
-// writeLockFile writes the current PID to the lock file.
+// writeLockFile writes the current PID to the lock file for debugging.
 func writeLockFile() error {
 	return os.WriteFile(lockFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 }
@@ -246,5 +227,4 @@ func writeLockFile() error {
 // removeLockFile removes the lock file (call on shutdown).
 func removeLockFile() {
 	_ = os.Remove(lockFile)
-	_ = os.Remove(socketPath)
 }
