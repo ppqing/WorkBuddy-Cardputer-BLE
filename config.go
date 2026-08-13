@@ -10,14 +10,16 @@ import (
 )
 
 type Config struct {
-	WSAddr   string
-	Timeout  time.Duration
-	LogLevel slog.Level
-	Version  string
+	Transport string
+	WSAddr    string
+	Timeout   time.Duration
+	LogLevel  slog.Level
+	Version   string
 }
 
 func ParseConfig() *Config {
 	var (
+		transport   = flag.String("transport", "ws", "Transport: ws (WebSocket) or ble (BLE)")
 		wsAddr      = flag.String("ws-addr", "0.0.0.0:8765", "WebSocket server address")
 		timeout     = flag.Duration("timeout", 300*time.Second, "Connection timeout")
 		logLevelStr = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
@@ -46,10 +48,11 @@ func ParseConfig() *Config {
 	}
 
 	return &Config{
-		WSAddr:   *wsAddr,
-		Timeout:  *timeout,
-		LogLevel: level,
-		Version:  version,
+		Transport: strings.ToLower(*transport),
+		WSAddr:    *wsAddr,
+		Timeout:   *timeout,
+		LogLevel:  level,
+		Version:   version,
 	}
 }
 

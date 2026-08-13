@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,17 +36,17 @@ func resolveStateFile(name string) string {
 	return filepath.Join("/tmp", name)
 }
 
-// Daemon runs the persistent WebSocket + UDP server and accepts
-// MCP client connections over a Unix domain socket.
+// Daemon runs the persistent bridge and accepts MCP client connections over
+// a Unix domain socket.
 type Daemon struct {
-	bridge  *Bridge
+	bridge  Bridger
 	logger  *slog.Logger
 	mu      sync.Mutex
 	active  bool
 	clients map[net.Conn]struct{}
 }
 
-func NewDaemon(bridge *Bridge, logger *slog.Logger) *Daemon {
+func NewDaemon(bridge Bridger, logger *slog.Logger) *Daemon {
 	return &Daemon{
 		bridge:  bridge,
 		logger:  logger,
@@ -53,13 +54,26 @@ func NewDaemon(bridge *Bridge, logger *slog.Logger) *Daemon {
 	}
 }
 
-func (d *Daemon) Start() error {
-	// Clean up stale socket
-	_ = os.Remove(socketPath)
+// errDaemonAlreadyRunning means another process won the race to become the
+// daemon; the caller should fall back to client mode.
+var errDaemonAlreadyRunning = errors.New("another ask-master daemon is already running")
 
+func (d *Daemon) Start() error {
+	// Never delete the socket unconditionally: if two processes start at the
+	// same moment, doing so would unlink the winner's socket and leave two
+	// daemons fighting over the same Cardputer.
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
-		return fmt.Errorf("listen unix socket: %w", err)
+		// The socket exists. Probe it to tell a live daemon from a stale file.
+		if conn, derr := net.Dial("unix", socketPath); derr == nil {
+			_ = conn.Close()
+			return errDaemonAlreadyRunning
+		}
+		_ = os.Remove(socketPath)
+		listener, err = net.Listen("unix", socketPath)
+		if err != nil {
+			return fmt.Errorf("listen unix socket: %w", err)
+		}
 	}
 
 	d.mu.Lock()

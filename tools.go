@@ -15,6 +15,30 @@ import (
 	"github.com/mhrsntrk/ask-master/internal/truncate"
 )
 
+// notifyCardputerSent sends a log notification to the MCP client so that
+// CodeBuddy displays a message in its chat while waiting for the Cardputer
+// response. This gives the user a visible prompt on both screens.
+func notifyCardputerSent(ctx context.Context, s *server.MCPServer, msg string) {
+	if s == nil {
+		return
+	}
+	notif := mcp.NewLoggingMessageNotification(mcp.LoggingLevelNotice, "ask-master", msg)
+	_ = s.SendLogMessageToClient(ctx, notif)
+}
+
+// Payload length budget, in runes. The device wraps and scrolls text, so these
+// limits only exist to bound one BLE message: the firmware's receive buffer is
+// 4 KB and CJK characters cost 3 bytes each in UTF-8, which keeps the worst
+// case (question + context + 6 options) comfortably inside it.
+//
+// Text over the limit is cut with an ellipsis so the human can see that
+// something was dropped rather than reading a sentence that stops mid-word.
+const (
+	maxQuestionRunes = 200
+	maxContextRunes  = 120
+	maxOptionRunes   = 80
+)
+
 func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
@@ -29,8 +53,6 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			mcp.WithInteger("timeout", mcp.Description("Timeout in milliseconds.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			_ = ctx
-
 			question, err := req.RequireString("question")
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
@@ -38,16 +60,21 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 
 			payload, err := jsonPayload(map[string]any{
 				"type":     "ask",
-				"question": truncate.String(question, 120),
-				"context":  req.GetString("context", ""),
+				"question": truncate.StringWithEllipsis(question, maxQuestionRunes),
+				"context":  truncate.StringWithEllipsis(req.GetString("context", ""), maxContextRunes),
 			})
 			if err != nil {
 				logger.Error("marshal ask-human payload failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
+			notifyCardputerSent(ctx, s, fmt.Sprintf("等待 Cardputer 输入: %s", question))
 			reply, err := bridge.SendAndWait(payload, "ask", nil, toolTimeout(req))
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn("ask-human timed out", "error", err)
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] Nobody answered in time. Please answer manually: %s", question)), nil
+				}
 				if isBridgeOffline(bridge, err) {
 					logger.Warn("ask-human offline fallback", "error", err)
 					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER OFFLINE] Please answer manually: %s", question)), nil
@@ -69,8 +96,6 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			mcp.WithInteger("timeout", mcp.Description("Timeout in milliseconds.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			_ = ctx
-
 			statement, err := req.RequireString("statement")
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
@@ -78,19 +103,30 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 
 			payload, err := jsonPayload(map[string]any{
 				"type":     "confirm",
-				"question": truncate.String(statement, 120),
-				"context":  truncate.String(req.GetString("consequence", ""), 60),
+				"question": truncate.StringWithEllipsis(statement, maxQuestionRunes),
+				"context":  truncate.StringWithEllipsis(req.GetString("consequence", ""), maxContextRunes),
 			})
 			if err != nil {
 				logger.Error("marshal confirm payload failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
+			notifyCardputerSent(ctx, s, fmt.Sprintf("等待 Cardputer 确认: %s", statement))
 			reply, err := bridge.SendAndWait(payload, "confirm", nil, toolTimeout(req))
 			if err != nil {
+				// A timeout and an offline device are NOT a human "no": keep them
+				// distinguishable from a real rejection.
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn("confirm timed out", "error", err)
+					return mcp.NewToolResultText(fmt.Sprintf(
+						"[CARDPUTER TIMEOUT] Nobody answered in time; treat as NOT confirmed (this is not a human \"no\"): %s",
+						statement)), nil
+				}
 				if isBridgeOffline(bridge, err) {
 					logger.Warn("confirm offline fallback", "error", err)
-					return mcp.NewToolResultText("false"), nil
+					return mcp.NewToolResultText(fmt.Sprintf(
+						"[CARDPUTER OFFLINE] Device unreachable; treat as NOT confirmed (this is not a human \"no\"): %s",
+						statement)), nil
 				}
 				logger.Error("confirm failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
@@ -131,13 +167,13 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 
 			truncatedOptions := make([]string, 0, len(options))
 			for _, option := range options {
-				truncatedOptions = append(truncatedOptions, truncate.String(option, 40))
+				truncatedOptions = append(truncatedOptions, truncate.StringWithEllipsis(option, maxOptionRunes))
 			}
 
 			payload, err := jsonPayload(map[string]any{
 				"type":     "choose",
-				"question": truncate.String(question, 100),
-				"context":  req.GetString("context", ""),
+				"question": truncate.StringWithEllipsis(question, maxQuestionRunes),
+				"context":  truncate.StringWithEllipsis(req.GetString("context", ""), maxContextRunes),
 				"options":  truncatedOptions,
 			})
 			if err != nil {
@@ -145,11 +181,21 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
+			notifyCardputerSent(ctx, s, fmt.Sprintf("等待 Cardputer 选择: %s", question))
 			reply, err := bridge.SendAndWait(payload, "choose", truncatedOptions, toolTimeout(req))
 			if err != nil {
+				// Never silently pass off the first option as a human choice.
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn("choose timed out", "error", err)
+					return mcp.NewToolResultText(fmt.Sprintf(
+						"[CARDPUTER TIMEOUT] Nobody chose in time; no option was selected: %s",
+						question)), nil
+				}
 				if isBridgeOffline(bridge, err) {
 					logger.Warn("choose offline fallback", "error", err)
-					return mcp.NewToolResultText(truncatedOptions[0]), nil
+					return mcp.NewToolResultText(fmt.Sprintf(
+						"[CARDPUTER OFFLINE] Device unreachable; no option was selected: %s",
+						question)), nil
 				}
 				logger.Error("choose failed", "error", err)
 				return mcp.NewToolResultError(err.Error()), nil
@@ -178,8 +224,8 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 
 			payload, err := jsonPayload(map[string]any{
 				"type":      "escalate",
-				"question":  truncate.String(question, 120),
-				"context":   truncate.String(req.GetString("context", ""), 60),
+				"question":  truncate.StringWithEllipsis(question, maxQuestionRunes),
+				"context":   truncate.StringWithEllipsis(req.GetString("context", ""), maxContextRunes),
 				"escalated": true,
 			})
 			if err != nil {
@@ -187,8 +233,13 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 
+			notifyCardputerSent(ctx, s, fmt.Sprintf("等待 Cardputer 紧急回复: %s", question))
 			reply, err := bridge.SendAndWait(payload, "escalate", nil, toolTimeout(req))
 			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					logger.Warn("escalate-to-human timed out", "error", err)
+					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER TIMEOUT] Nobody answered in time. Please answer manually: %s", question)), nil
+				}
 				if isBridgeOffline(bridge, err) {
 					logger.Warn("escalate-to-human offline fallback", "error", err)
 					return mcp.NewToolResultText(fmt.Sprintf("[CARDPUTER OFFLINE] Please answer manually: %s", question)), nil

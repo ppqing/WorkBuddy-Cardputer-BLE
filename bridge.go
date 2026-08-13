@@ -82,6 +82,7 @@ type Bridger interface {
 	Connected() bool
 	DeviceOnline() bool
 	SendAndWait(payload string, questionType string, options []string, timeout time.Duration) (string, error)
+	Shutdown() error
 }
 
 type Bridge struct {

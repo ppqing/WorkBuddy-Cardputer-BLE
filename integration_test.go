@@ -169,7 +169,7 @@ func TestIntegration_OfflineDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("confirm handler returned error: %v", err)
 	}
-	assertToolText(t, result, "false")
+	assertToolText(t, result, "[CARDPUTER OFFLINE] Device unreachable; treat as NOT confirmed (this is not a human \"no\"): Delete all data?")
 
 	chooseTool := s.GetTool("choose")
 	if chooseTool == nil {
@@ -182,7 +182,7 @@ func TestIntegration_OfflineDegradation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("choose handler returned error: %v", err)
 	}
-	assertToolText(t, result, "us-east")
+	assertToolText(t, result, "[CARDPUTER OFFLINE] Device unreachable; no option was selected: Which region?")
 }
 
 func TestIntegration_Timeout(t *testing.T) {
@@ -212,8 +212,11 @@ func TestIntegration_Timeout(t *testing.T) {
 		t.Fatalf("handler returned error: %v", err)
 	}
 
-	if !result.IsError {
-		t.Fatal("expected error result for timeout, got non-error")
+	// A timeout now yields an explicit, machine-readable text answer instead of
+	// a generic tool error, so the caller can tell "nobody answered" apart from
+	// an actual human reply.
+	if result.IsError {
+		t.Fatal("expected non-error tool result for timeout")
 	}
 	if len(result.Content) != 1 {
 		t.Fatalf("expected 1 content item, got %d", len(result.Content))
@@ -222,7 +225,7 @@ func TestIntegration_Timeout(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected text content, got %T", result.Content[0])
 	}
-	if !strings.Contains(text.Text, "context deadline exceeded") && !strings.Contains(text.Text, "deadline exceeded") {
-		t.Fatalf("expected timeout error text, got %q", text.Text)
+	if !strings.Contains(text.Text, "[CARDPUTER TIMEOUT]") {
+		t.Fatalf("expected timeout marker, got %q", text.Text)
 	}
 }

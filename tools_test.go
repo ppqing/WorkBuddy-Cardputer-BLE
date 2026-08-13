@@ -60,7 +60,7 @@ func TestAskHuman_Success(t *testing.T) {
 func TestAskHuman_Truncation(t *testing.T) {
 	bridge := &stubBridge{reply: "ok"}
 	handler := registeredHandler(t, bridge, "ask-human")
-	question := strings.Repeat("q", 121)
+	question := strings.Repeat("q", maxQuestionRunes+1)
 
 	result, err := handler(context.Background(), toolRequest("ask-human", map[string]any{"question": question}))
 	if err != nil {
@@ -68,9 +68,11 @@ func TestAskHuman_Truncation(t *testing.T) {
 	}
 
 	assertToolText(t, result, "ok")
+	// Over-long text is cut with an ellipsis so the human can tell that the
+	// message continues beyond what the device shows.
 	assertJSONPayload(t, bridge.payload, map[string]any{
 		"type":     "ask",
-		"question": strings.Repeat("q", 120),
+		"question": strings.Repeat("q", maxQuestionRunes-3) + "...",
 		"context":  "",
 	})
 }
@@ -83,7 +85,22 @@ func TestConfirm_Offline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler returned error: %v", err)
 	}
-	assertToolText(t, result, "false")
+	// Must stay distinguishable from a human pressing "n".
+	assertToolText(t, result, "[CARDPUTER OFFLINE] Device unreachable; treat as NOT confirmed (this is not a human \"no\"): Delete production?")
+	if result.IsError {
+		t.Fatal("expected non-error tool result")
+	}
+}
+
+func TestConfirm_Timeout(t *testing.T) {
+	bridge := &stubBridge{err: context.DeadlineExceeded, online: true}
+	handler := registeredHandler(t, bridge, "confirm")
+
+	result, err := handler(context.Background(), toolRequest("confirm", map[string]any{"statement": "Delete production?"}))
+	if err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	assertToolText(t, result, "[CARDPUTER TIMEOUT] Nobody answered in time; treat as NOT confirmed (this is not a human \"no\"): Delete production?")
 	if result.IsError {
 		t.Fatal("expected non-error tool result")
 	}
@@ -131,7 +148,6 @@ func TestConfirm_Success_No(t *testing.T) {
 func TestChoose_Offline(t *testing.T) {
 	bridge := &stubBridge{err: errBridgeDisconnected}
 	handler := registeredHandler(t, bridge, "choose")
-	options := []string{"safe", "fast"}
 
 	result, err := handler(context.Background(), toolRequest("choose", map[string]any{
 		"question": "Mode?",
@@ -141,7 +157,8 @@ func TestChoose_Offline(t *testing.T) {
 		t.Fatalf("handler returned error: %v", err)
 	}
 
-	assertToolText(t, result, options[0])
+	// Must not masquerade the first option as a human choice.
+	assertToolText(t, result, "[CARDPUTER OFFLINE] Device unreachable; no option was selected: Mode?")
 	if result.IsError {
 		t.Fatal("expected non-error tool result")
 	}
@@ -215,36 +232,40 @@ func TestChoose_TooManyOptions(t *testing.T) {
 }
 
 func TestChoose_Truncation(t *testing.T) {
-	bridge := &stubBridge{reply: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	optA := strings.Repeat("a", maxOptionRunes-3) + "..."
+	optB := strings.Repeat("b", maxOptionRunes-3) + "..."
+
+	bridge := &stubBridge{reply: optB}
 	handler := registeredHandler(t, bridge, "choose")
 
 	result, err := handler(context.Background(), toolRequest("choose", map[string]any{
-		"question": strings.Repeat("q", 101),
+		"question": strings.Repeat("q", maxQuestionRunes+1),
 		"options": []any{
-			strings.Repeat("a", 41),
-			strings.Repeat("b", 41),
+			strings.Repeat("a", maxOptionRunes+1),
+			strings.Repeat("b", maxOptionRunes+1),
 		},
 	}))
 	if err != nil {
 		t.Fatalf("handler returned error: %v", err)
 	}
 
-	assertToolText(t, result, strings.Repeat("b", 40))
+	assertToolText(t, result, optB)
 	assertJSONPayload(t, bridge.payload, map[string]any{
 		"type":     "choose",
-		"question": strings.Repeat("q", 100),
+		"question": strings.Repeat("q", maxQuestionRunes-3) + "...",
 		"context":  "",
 		"options": []any{
-			strings.Repeat("a", 40),
-			strings.Repeat("b", 40),
+			optA,
+			optB,
 		},
 	})
-	assertStringSliceEqual(t, bridge.options, []string{strings.Repeat("a", 40), strings.Repeat("b", 40)})
+	assertStringSliceEqual(t, bridge.options, []string{optA, optB})
 }
 
 type stubBridge struct {
 	reply        string
 	err          error
+	online       bool // device reachable even though the call failed (e.g. timeout)
 	payload      string
 	questionType string
 	options      []string
@@ -252,11 +273,11 @@ type stubBridge struct {
 }
 
 func (s *stubBridge) Connected() bool {
-	return s.err == nil
+	return s.err == nil || s.online
 }
 
 func (s *stubBridge) DeviceOnline() bool {
-	return s.err == nil
+	return s.err == nil || s.online
 }
 
 func (s *stubBridge) SendAndWait(payload string, questionType string, options []string, timeout time.Duration) (string, error) {
@@ -268,6 +289,10 @@ func (s *stubBridge) SendAndWait(payload string, questionType string, options []
 		return "", s.err
 	}
 	return s.reply, nil
+}
+
+func (s *stubBridge) Shutdown() error {
+	return nil
 }
 
 func registeredHandler(t *testing.T, bridge Bridger, toolName string) server.ToolHandlerFunc {

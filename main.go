@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -32,24 +33,57 @@ func main() {
 		logger.Error("failed to write lock file", "error", err)
 		os.Exit(1)
 	}
-	defer removeLockFile()
-
-	bridge := NewBridge(logger)
-
-	if err := bridge.StartUDP(); err != nil {
-		logger.Error("UDP listener failed", "error", err)
-		os.Exit(1)
-	}
-	logger.Info("UDP beacon listener started", "port", udpBeaconPort)
-
-	go func() {
-		if err := bridge.StartWS(cfg.WSAddr); err != nil {
-			logger.Error("bridge server failed", "error", err)
+	// Only the process that actually owns the socket may clean these up,
+	// otherwise a racing loser would unlink the winner's socket.
+	ownsDaemonState := true
+	defer func() {
+		if ownsDaemonState {
+			removeLockFile()
 		}
 	}()
 
+	var bridge Bridger
+
+	switch cfg.Transport {
+	case "ble":
+		bleBridge := NewBLEBridge(logger)
+		if err := bleBridge.Start(); err != nil {
+			logger.Error("BLE bridge failed to start", "error", err)
+			os.Exit(1)
+		}
+		bridge = bleBridge
+		logger.Info("BLE transport active (device: ask-master)")
+	default:
+		wsBridge := NewBridge(logger)
+		if err := wsBridge.StartUDP(); err != nil {
+			logger.Error("UDP listener failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("UDP beacon listener started", "port", udpBeaconPort)
+		go func() {
+			if err := wsBridge.StartWS(cfg.WSAddr); err != nil {
+				logger.Error("bridge server failed", "error", err)
+			}
+		}()
+		bridge = wsBridge
+	}
+
 	daemon := NewDaemon(bridge, logger)
 	if err := daemon.Start(); err != nil {
+		// Another process won the race to own the socket. Release our device
+		// connection and proxy stdio to that daemon instead.
+		if errors.Is(err, errDaemonAlreadyRunning) {
+			logger.Info("another daemon won the startup race, running in client mode")
+			ownsDaemonState = false
+			if serr := bridge.Shutdown(); serr != nil {
+				logger.Warn("bridge shutdown failed", "error", serr)
+			}
+			if cerr := runClientMode(logger); cerr != nil {
+				logger.Error("client mode failed", "error", cerr)
+				os.Exit(1)
+			}
+			return
+		}
 		logger.Error("daemon failed", "error", err)
 		os.Exit(1)
 	}
