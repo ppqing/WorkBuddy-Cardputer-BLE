@@ -220,7 +220,53 @@ python daemon_keeper.py
 把下面这段文本发给你的 AI agent（作为 system prompt 或对话首条消息），它就会知道如何通过 ask-master 与你沟通：
 
 ````text
-你现在接入了一个名为 ask-master 的 MCP 服务器，它通过一台 M5Stack Cardputer 蓝牙设备与我（真人用户）沟通。当你在开发过程中需要我确认、选择、输入文本或做紧急决策时，请使用以下 4 个 MCP 工具，而不是在聊天里一直等我回复。
+你现在要接入一个名为 ask-master 的 MCP 服务器，它通过一台 M5Stack Cardputer 蓝牙设备与我（真人用户）沟通。下面包含完整的搭建、运行和使用说明。如果环境还没搭好，先按「环境搭建」和「运行」操作；如果已搭好，直接看「可用工具」和「使用规范」。
+
+## 环境搭建（一次性，仅当环境未就绪时执行）
+
+1. 安装依赖
+   - Python 依赖（BLE + 语音转写 + 性能监控）：
+     pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
+   - Go 1.22+
+   - Arduino CLI + M5Stack ESP32 开发板支持（烧录固件用）
+
+2. 构建服务端
+   cd <项目目录>
+   go build -o ask-master.exe .
+
+3. 烧录固件到 Cardputer
+   # 安装 Arduino 依赖
+   arduino-cli core install m5stack:esp32@2.1.4
+   arduino-cli lib install "M5Unified@0.2.19" "M5GFX@0.2.26" "NimBLE-Arduino@1.4.0" "ArduinoJson@7.0.4"
+   # 将项目里的 M5CardputerBLE/ 目录安装为 Arduino 库
+
+   # 编译（Windows）
+   .\fwbuild.ps1
+
+   # 烧录（首次需全量写入）
+   esptool.py --chip esp32s3 --port COM3 --baud 921600 write_flash \
+     0x0      firmware/ask_master_ble/build/ask_master_ble.ino.bootloader.bin \
+     0x8000   firmware/ask_master_ble/build/ask_master_ble.ino.partitions.bin \
+     0x10000  firmware/ask_master_ble/build/ask_master_ble.ino.bin
+
+   注意：不要用 M5Launcher 烧录，它会覆盖分区表导致黑屏。
+
+## 运行
+
+1. 启动 daemon（常驻，自动连接 Cardputer 蓝牙设备 "Claude AskMaster"）
+   cd <项目目录>
+   python daemon_keeper.py
+
+2. 配置 MCP 客户端：把 ask-master 注册到 MCP 配置文件
+   （CodeBuddy: ~/.codebuddy/mcp.json；Claude Code: ~/.claude/settings.json；Cursor: ~/.cursor/mcp.json）
+   {
+     "mcpServers": {
+       "ask-master": {
+         "command": "<项目目录>/ask-master.exe",
+         "args": ["--transport", "ble"]
+       }
+     }
+   }
 
 ## 可用工具
 
