@@ -228,13 +228,29 @@ python daemon_keeper.py
    - Python 依赖（BLE + 语音转写 + 性能监控）：
      pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
    - Go 1.22+
-   - Arduino CLI + M5Stack ESP32 开发板支持（烧录固件用）
 
 2. 构建服务端
    cd <项目目录>
    go build -o ask-master.exe .
 
-3. 烧录固件到 Cardputer
+## 运行
+
+1. 启动 daemon（常驻，自动扫描并连接 Cardputer 蓝牙设备 "Claude AskMaster"）
+   cd <项目目录>
+   python daemon_keeper.py
+
+2. 探测 BLE 是否可用：检查 daemon 日志（daemon.log）是否出现
+   "BLE connected: true"，或用以下命令手动扫描：
+   python -c "import asyncio; from bleak import BleakScanner; \
+     asyncio.run(BleakScanner.discover(timeout=10.0))" | findstr /i "Claude AskMaster"
+
+   - 能搜到 "Claude AskMaster" → 设备固件已就绪，直接跳到第 4 步使用，无需烧录。
+   - 搜不到 → 按顺序排查：
+     a) 提示用户：确认 Cardputer 已开机（屏幕亮着，显示待机画面）。
+     b) 确认设备已配对/在蓝牙范围内（设备被连接后会停止广播，属正常）。
+     c) 若确认是「从未烧录过本固件」的新设备，才走下面「烧录固件」流程。
+
+3. （可选，仅当设备从未烧录过本固件时）烧录固件到 Cardputer
    # 安装 Arduino 依赖
    arduino-cli core install m5stack:esp32@2.1.4
    arduino-cli lib install "M5Unified@0.2.19" "M5GFX@0.2.26" "NimBLE-Arduino@1.4.0" "ArduinoJson@7.0.4"
@@ -251,13 +267,7 @@ python daemon_keeper.py
 
    注意：不要用 M5Launcher 烧录，它会覆盖分区表导致黑屏。
 
-## 运行
-
-1. 启动 daemon（常驻，自动连接 Cardputer 蓝牙设备 "Claude AskMaster"）
-   cd <项目目录>
-   python daemon_keeper.py
-
-2. 配置 MCP 客户端：把 ask-master 注册到 MCP 配置文件
+4. 配置 MCP 客户端：把 ask-master 注册到 MCP 配置文件
    （CodeBuddy: ~/.codebuddy/mcp.json；Claude Code: ~/.claude/settings.json；Cursor: ~/.cursor/mcp.json）
    {
      "mcpServers": {
