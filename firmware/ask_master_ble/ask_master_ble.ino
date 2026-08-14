@@ -52,7 +52,6 @@ int pcMem = -1;   // 内存使用率 %
 int pcNetDn = 0;  // 下载速度 bytes/s
 int pcNetUp = 0;  // 上传速度 bytes/s
 bool hasMetrics = false;
-bool metricsPaused = false;  // W 键：暂停/恢复性能监控显示
 int speakerVolume = 192;     // 提示音音量 0~255，默认 75%
 
 // BLE 接收缓冲（可能分多次 notify 到达）
@@ -466,8 +465,8 @@ void processLine(const String& message) {
         pcNetDn = doc["net_dn"].as<int>();
         pcNetUp = doc["net_up"].as<int>();
         hasMetrics = true;
-        // 待机界面实时刷新（已连接或未连接都显示最新数据）；暂停时冻结显示。
-        if (!metricsPaused && (currentState == IDLE || currentState == SLEEP)) {
+        // 待机界面实时刷新（已连接或未连接都显示最新数据）
+        if (currentState == IDLE || currentState == SLEEP) {
             drawStandbyScreen(M5Cardputer.BLE.connected());
         }
         return;
@@ -621,13 +620,6 @@ void handleKeyboard() {
                 drawIdleScreen(APP_VERSION, info.c_str(), false);
                 delay(1500);
                 transitionToSleep();
-                return;
-            }
-            if (c == 'w' || c == 'W') {
-                metricsPaused = !metricsPaused;
-                M5Cardputer.Speaker.tone(BEEP_ANSWER_FREQ, 60);
-                drawStandbyScreen(M5Cardputer.BLE.connected());
-                lastActivityTime = millis();
                 return;
             }
             if (c == 'l' || c == 'L') {
