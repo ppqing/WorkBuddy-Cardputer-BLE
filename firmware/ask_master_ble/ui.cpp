@@ -571,6 +571,22 @@ void drawIdleScreen(const char* version, const char* ip, bool showSetupHint) {
 // ============================================================================
 // STANDBY（统一待机界面：未连接 / 已连接共用同一界面）
 // ============================================================================
+// 把 bytes/s 格式化为可读字符串（如 "1.2MB/s" / "500KB/s"）。
+static String formatRate(int bytesPerSec) {
+    if (bytesPerSec < 0) {
+        return String("--");
+    }
+    char buf[20];
+    if (bytesPerSec >= 1024 * 1024) {
+        snprintf(buf, sizeof(buf), "%.1fMB/s", bytesPerSec / (1024.0f * 1024.0f));
+    } else if (bytesPerSec >= 1024) {
+        snprintf(buf, sizeof(buf), "%.0fKB/s", bytesPerSec / 1024.0f);
+    } else {
+        snprintf(buf, sizeof(buf), "%dB/s", bytesPerSec);
+    }
+    return String(buf);
+}
+
 void drawStandbyScreen(bool connected) {
     initCanvasIfNeeded();
     canvas.fillSprite(UI_RGB_BG);
@@ -583,14 +599,38 @@ void drawStandbyScreen(bool connected) {
     canvas.setTextDatum(middle_center);
 
     if (connected) {
-        // 已连接：显示就绪
+        // 已连接：显示就绪 + 性能监控数据（若有）
         useChromeFont();
         canvas.setTextColor(cDim());
-        canvas.drawString("ask-master", 120, UI_BODY_Y + 12);
+        canvas.drawString("ask-master", 120, UI_BODY_Y + 8);
 
-        useBodyFont();
-        canvas.setTextColor(UI_RGB_FG);
-        canvas.drawString(L("就绪", "ready"), 120, UI_BODY_Y + 38);
+        if (hasMetrics) {
+            useBodyFont();
+            canvas.setTextColor(UI_RGB_FG);
+
+            // 第一行：CPU / GPU
+            char line1[48];
+            if (pcGpu >= 0) {
+                snprintf(line1, sizeof(line1), "CPU %d%%  GPU %d%%", pcCpu, pcGpu);
+            } else {
+                snprintf(line1, sizeof(line1), "CPU %d%%", pcCpu);
+            }
+            canvas.drawString(line1, 120, UI_BODY_Y + 32);
+
+            // 第二行：内存
+            char line2[32];
+            snprintf(line2, sizeof(line2), L("内存 %d%%", "MEM %d%%"), pcMem);
+            canvas.drawString(line2, 120, UI_BODY_Y + 52);
+
+            // 第三行：网速（下载/上传）
+            String line3 = String(L("下", "D")) + " " + formatRate(pcNetDn) +
+                           "  " + String(L("上", "U")) + " " + formatRate(pcNetUp);
+            canvas.drawString(line3.c_str(), 120, UI_BODY_Y + 72);
+        } else {
+            useBodyFont();
+            canvas.setTextColor(UI_RGB_FG);
+            canvas.drawString(L("就绪", "ready"), 120, UI_BODY_Y + 38);
+        }
     } else {
         // 未连接：等待蓝牙连接
         canvas.drawString("zZz", 120, UI_BODY_Y + 20);

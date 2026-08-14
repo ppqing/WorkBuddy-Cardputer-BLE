@@ -57,6 +57,11 @@ TX_CHAR = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 SCAN_TIMEOUT = 10.0
 RETRY_DELAY = 2.0
+# 性能监控采样间隔（秒）。设为 0 表示禁用。
+# 注意：metrics 与 prompt 命令共用 BLE 写通道，推送过频会干扰核心
+# prompt 通信（导致 prompt 偶发丢失/设备端粘包）。先禁用，后续改为
+# 设备端主动拉取或降低频率后再启用。
+METRICS_INTERVAL = 0.0
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_DIR = os.path.join(tempfile.gettempdir(), "ask-master-audio")
@@ -242,6 +247,73 @@ def emit(obj):
     sys.stdout.flush()
 
 
+# ---------------------------------------------------------------------------
+# 性能监控：采集 CPU / GPU / 内存 / 网速
+# ---------------------------------------------------------------------------
+
+_metrics_state = {"time": 0.0, "dn": 0, "up": 0}
+_nvml_handle = None
+
+
+def _get_nvml_handle():
+    """返回 NVML 句柄（首次调用时初始化），失败返回 None。"""
+    global _nvml_handle
+    if _nvml_handle is not None:
+        return _nvml_handle
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    except Exception:
+        _nvml_handle = False  # 标记为不可用，避免反复初始化
+    return _nvml_handle if _nvml_handle else None
+
+
+def collect_metrics():
+    """采集一次性能数据，返回 dict（不含 type 字段，由调用方补充）。
+
+    - cpu: CPU 使用率 %（-1 表示不可用）
+    - gpu: GPU 使用率 %（-1 表示无 GPU/不可用）
+    - mem: 内存使用率 %（-1 表示不可用）
+    - net_dn / net_up: 下载/上传速度 bytes/s（需要两次采样求差值）
+    """
+    m = {"cpu": -1, "gpu": -1, "mem": -1, "net_dn": 0, "net_up": 0}
+
+    try:
+        import psutil
+
+        m["cpu"] = int(psutil.cpu_percent(interval=None))
+        m["mem"] = int(psutil.virtual_memory().percent)
+
+        # 网速：两次采样求差值
+        now = time.time()
+        io = psutil.net_io_counters()
+        st = _metrics_state
+        if st["time"] > 0:
+            dt = now - st["time"]
+            if dt > 0:
+                m["net_dn"] = max(0, int((io.bytes_recv - st["dn"]) / dt))
+                m["net_up"] = max(0, int((io.bytes_sent - st["up"]) / dt))
+        st["time"] = now
+        st["dn"] = io.bytes_recv
+        st["up"] = io.bytes_sent
+    except Exception:
+        pass
+
+    handle = _get_nvml_handle()
+    if handle:
+        try:
+            import pynvml
+
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            m["gpu"] = int(util.gpu)
+        except Exception:
+            pass
+
+    return m
+
+
 async def stdin_reader(cmd_q):
     """Read commands from the daemon forever, independent of BLE link state."""
     loop = asyncio.get_running_loop()
@@ -262,11 +334,31 @@ async def stdin_reader(cmd_q):
 
 
 async def pump(client, cmd_q, state):
-    """Forward queued commands to the device until the link drops."""
+    """Forward queued commands to the device until the link drops.
+
+    Also periodically samples PC performance (CPU/GPU/mem/net) and pushes it
+    to the device so the standby screen can display it.
+    """
+    last_metrics = 0.0
     while client.is_connected:
         try:
             msg = await asyncio.wait_for(cmd_q.get(), timeout=1.0)
         except asyncio.TimeoutError:
+            # 空闲时定时推送性能数据（仅在无待发命令的间隙发送）
+            if METRICS_INTERVAL <= 0:
+                continue
+            now = time.time()
+            if now - last_metrics >= METRICS_INTERVAL:
+                last_metrics = now
+                metrics = collect_metrics()
+                metrics["type"] = "metrics"
+                try:
+                    await client.write_gatt_char(
+                        RX_CHAR, (json.dumps(metrics, ensure_ascii=False) + "\n").encode("utf-8")
+                    )
+                except Exception as e:
+                    emit({"event": "log", "msg": "metrics write error: %r" % e})
+                    return
             continue
         if msg is None:
             raise _Shutdown()
@@ -422,7 +514,9 @@ async def process_audio_end(adpcm, meta, state):
     emit({"event": "log", "msg": "voice captured: %d samples -> %s" % (len(samples), wav_path)})
 
     loop = asyncio.get_running_loop()
+    emit({"event": "log", "msg": "transcribe start: mode=%s" % meta.get("mode")})
     text = await loop.run_in_executor(None, transcribe, wav_path)
+    emit({"event": "log", "msg": "transcribe done: text=%r" % (text,)})
 
     # 键盘输入模式：转写结果直接输入电脑聚焦窗口，不回传 agent。
     if meta.get("mode") == "keyboard":
@@ -439,8 +533,9 @@ async def process_audio_end(adpcm, meta, state):
         reply = {
             "cmd": "input",
             "id": pid,
-            "text": "[voice: %s] (faster-whisper 未安装，未转写)" % wav_path.replace("\\", "/"),
+            "text": "[voice] (未识别到语音，请重试)",
         }
+    emit({"event": "log", "msg": "voice reply: pid=%s text=%r" % (pid, text)})
     emit({"event": "recv", "line": json.dumps(reply, ensure_ascii=False)})
 
 
@@ -501,19 +596,23 @@ async def main():
                     try:
                         obj = json.loads(s)
                     except Exception:
-                        obj = None
-                    if obj and obj.get("evt") == "audio":
+                        # 解析失败：可能是音频帧被 BLE 分包后残片/错乱。
+                        # 合法回复（permission/input）都是完整 JSON，不会到这里。
+                        # 忽略残片，避免把音频数据当作回复发给 agent。
+                        emit({"event": "log", "msg": "dropped unparsable notify: %r" % s[:60]})
+                        continue
+                    if obj.get("evt") == "audio":
                         try:
                             audio_buf += base64.b64decode(obj.get("data", ""))
                         except Exception:
                             pass
                         continue
-                    if obj and obj.get("evt") == "audio_end":
+                    if obj.get("evt") == "audio_end":
                         payload = bytes(audio_buf)
                         audio_buf = bytearray()
                         asyncio.ensure_future(process_audio_end(payload, obj, state))
                         continue
-                    if obj and obj.get("evt") == "key":
+                    if obj.get("evt") == "key":
                         # 键盘转发：Cardputer 实体键 -> 电脑聚焦窗口
                         type_key(obj.get("key", ""))
                         continue

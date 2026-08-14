@@ -5,6 +5,14 @@
 
 // System language, defined in the main .ino. "zh" = Chinese, "en" = English.
 extern String sysLang;
+
+// 性能监控数据（由 PC 端推送，在待机界面显示）。
+extern int pcCpu;
+extern int pcGpu;
+extern int pcMem;
+extern int pcNetDn;
+extern int pcNetUp;
+extern bool hasMetrics;
 // L() returns a plain const char* (not __FlashStringHelper*) so it can be
 // passed to functions expecting const char*.
 #define L(zh, en) (sysLang == "zh" ? (const char*)(zh) : (const char*)(en))

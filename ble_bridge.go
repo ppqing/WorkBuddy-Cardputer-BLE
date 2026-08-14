@@ -442,6 +442,7 @@ func (b *BLEBridge) receive(line string) {
 	reply := strings.TrimSpace(line)
 
 	// 新协议格式：JSON cmd 对象
+	isCustomInput := false
 	if strings.HasPrefix(reply, "{") {
 		var resp struct {
 			Cmd  string `json:"cmd"`
@@ -462,13 +463,17 @@ func (b *BLEBridge) receive(line string) {
 					reply = resp.Decision // "once" / "deny"
 				}
 			case "input":
-				reply = resp.Text // free text
+				// 自由文本（ask/escalate 输入，或 choose 的「自定义输入」选项）
+				reply = resp.Text
+				isCustomInput = true
 			}
 		}
 		// else: unrecognized JSON, pass through as-is
 	}
 
-	if pq.questionType == "choose" {
+	// choose 的「自定义输入」选项会以 input 命令返回自由文本，
+	// 应原样返回，不经过选项序号映射。
+	if pq.questionType == "choose" && !isCustomInput {
 		mapped, err := mapChooseReply(reply, pq.options)
 		if err != nil {
 			select {

@@ -42,7 +42,16 @@ String currentQuestion;
 String currentContext;
 String currentOptions[6];
 int currentOptionCount = 0;
+bool currentHasCustom = false;  // choose 界面最后一个选项是否为「自定义输入」
 String currentType;
+
+// 性能监控数据（PC 端定时推送）
+int pcCpu = -1;   // CPU 使用率 %
+int pcGpu = -1;   // GPU 使用率 %（-1 表示无 GPU）
+int pcMem = -1;   // 内存使用率 %
+int pcNetDn = 0;  // 下载速度 bytes/s
+int pcNetUp = 0;  // 上传速度 bytes/s
+bool hasMetrics = false;
 
 // BLE 接收缓冲（可能分多次 notify 到达）
 // onBLEReceive() 运行在 NimBLE 任务上下文，handleBLEInput() 运行在主循环，
@@ -180,12 +189,14 @@ void loop() {
 
     // P1 语音输入：按住 Ctrl 说话，松开 Ctrl 结束录音并发送 audio_end。
     // 两种触发场景：
-    //   1) WAITING_INPUT(ask/escalate)：prompt 模式，PC 端转写后回 input 回复。
+    //   1) WAITING_INPUT(ask/escalate/choose)：prompt 模式，PC 端转写后回 input 回复。
+    //      choose 界面按住 Ctrl 直接语音 = 自定义回复（无需先选「自定义输入」）。
     //   2) IDLE（已连接无 prompt）：keyboard 模式，PC 端转写后直接输入电脑聚焦窗口。
     audioTick();  // 未录音时是 no-op
 
     bool promptVoice = (currentState == WAITING_INPUT &&
-                        (currentType == "ask" || currentType == "escalate"));
+                        (currentType == "ask" || currentType == "escalate" ||
+                         currentType == "choose"));
     bool keyboardVoice = (currentState == IDLE);
 
     if (promptVoice || keyboardVoice) {
@@ -436,6 +447,21 @@ void processLine(const String& message) {
         return;
     }
 
+    // ---- 性能监控数据（PC 端定时推送） ----
+    if (doc["type"] == "metrics") {
+        pcCpu = doc["cpu"].as<int>();
+        pcGpu = doc["gpu"].as<int>();
+        pcMem = doc["mem"].as<int>();
+        pcNetDn = doc["net_dn"].as<int>();
+        pcNetUp = doc["net_up"].as<int>();
+        hasMetrics = true;
+        // 待机界面实时刷新（已连接或未连接都显示最新数据）
+        if (currentState == IDLE || currentState == SLEEP) {
+            drawStandbyScreen(M5Cardputer.BLE.connected());
+        }
+        return;
+    }
+
     // ---- 心跳快照（无 prompt 字段） ----
     if (!doc["prompt"].is<JsonObject>() && doc["total"].is<int>()) {
         // 纯心跳：显示状态摘要后回到 IDLE
@@ -494,6 +520,14 @@ void processLine(const String& message) {
                 break;
             }
             currentOptions[currentOptionCount++] = option.as<String>();
+        }
+        // 预留最后一个位置给「自定义输入」选项（最多 6 项）。
+        // 用户选择它后进入文本输入模式，输入内容作为自定义回复。
+        currentHasCustom = false;
+        if (currentOptionCount < 6) {
+            currentOptions[currentOptionCount] = L("自定义输入", "Custom...");
+            currentOptionCount++;
+            currentHasCustom = true;
         }
     }
 
@@ -665,12 +699,22 @@ void handleKeyboard() {
             if (c >= '1' && c <= '6') {
                 int choice = c - '0';
                 if (choice <= currentOptionCount) {
+                    // 选择「自定义输入」→ 切换到文本输入模式（复用 ask 输入逻辑）
+                    if (currentHasCustom && choice == currentOptionCount) {
+                        currentType = "ask";
+                        ime.reset();
+                        scrollOffset = 0;
+                        maxScrollOffset = 0;
+                        renderCurrentScreen();
+                        return;
+                    }
                     // 新协议：发送 permission 命令 + option 扩展
                     sendPermission(currentPromptID, "once", choice);
                     return;
                 }
             }
         }
+        return;
     }
 }
 
@@ -755,6 +799,7 @@ void clearCurrentPrompt() {
     currentQuestion = "";
     currentContext = "";
     currentOptionCount = 0;
+    currentHasCustom = false;
     currentType = "";
     scrollOffset = 0;
     maxScrollOffset = 0;

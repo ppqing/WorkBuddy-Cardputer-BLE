@@ -152,8 +152,9 @@ func RegisterTools(s *server.MCPServer, bridge Bridger, logger *slog.Logger) {
 			}
 
 			options := req.GetStringSlice("options", nil)
-			if len(options) < 2 || len(options) > 6 {
-				return mcp.NewToolResultError("options must have 2-6 items"), nil
+			// 最多 5 个：设备会自动追加第 6 个「自定义输入」选项，允许用户输入自定义回复。
+			if len(options) < 2 || len(options) > 5 {
+				return mcp.NewToolResultError("options must have 2-5 items (a custom-input option is auto-appended)"), nil
 			}
 
 			truncatedOptions := make([]string, 0, len(options))
@@ -260,9 +261,11 @@ func newPromptPayload(tool, question, context string, options []string, input bo
 }
 
 func toolTimeout(req mcp.CallToolRequest) time.Duration {
-	timeoutMS := req.GetInt("timeout", 30000)
+	// 默认 60 秒：语音输入（按住 Ctrl 录音 + 转写）需要更长的等待时间，
+	// 30 秒在用户反应 + 录音 + 转写的完整流程下容易超时。
+	timeoutMS := req.GetInt("timeout", 60000)
 	if timeoutMS <= 0 {
-		timeoutMS = 30000
+		timeoutMS = 60000
 	}
 	return time.Duration(timeoutMS) * time.Millisecond
 }
