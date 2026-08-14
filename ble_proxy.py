@@ -57,11 +57,10 @@ TX_CHAR = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 SCAN_TIMEOUT = 10.0
 RETRY_DELAY = 2.0
-# 性能监控采样间隔（秒）。设为 0 表示禁用。
-# 注意：metrics 与 prompt 命令共用 BLE 写通道，推送过频会干扰核心
-# prompt 通信（导致 prompt 偶发丢失/设备端粘包）。先禁用，后续改为
-# 设备端主动拉取或降低频率后再启用。
-METRICS_INTERVAL = 0.0
+# 性能监控采样间隔（秒）。
+# 收到 prompt 推送期间自动暂停（state["in_prompt"]），推送结束回到
+# 主界面后恢复推送。避免 metrics 与 prompt 命令争抢 BLE 写通道。
+METRICS_INTERVAL = 2.0
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_DIR = os.path.join(tempfile.gettempdir(), "ask-master-audio")
@@ -344,8 +343,10 @@ async def pump(client, cmd_q, state):
         try:
             msg = await asyncio.wait_for(cmd_q.get(), timeout=1.0)
         except asyncio.TimeoutError:
-            # 空闲时定时推送性能数据（仅在无待发命令的间隙发送）
-            if METRICS_INTERVAL <= 0:
+            # 空闲时定时推送性能数据。
+            # 仅在「无待发命令」且「不在 prompt 推送期间」的间隙发送，
+            # 避免 metrics 与 prompt 命令争抢 BLE 写通道。
+            if METRICS_INTERVAL <= 0 or state.get("in_prompt", False):
                 continue
             now = time.time()
             if now - last_metrics >= METRICS_INTERVAL:
@@ -371,6 +372,8 @@ async def pump(client, cmd_q, state):
             pid = (p.get("prompt") or {}).get("id")
             if pid:
                 state["prompt_id"] = pid
+                # 推送期间暂停性能监控（推送界面无位置展示）。
+                state["in_prompt"] = True
         except Exception:
             pass
         try:
@@ -535,6 +538,8 @@ async def process_audio_end(adpcm, meta, state):
             "id": pid,
             "text": "[voice] (未识别到语音，请重试)",
         }
+    # 语音回复意味着用户已回应，推送结束，恢复性能监控。
+    state["in_prompt"] = False
     emit({"event": "log", "msg": "voice reply: pid=%s text=%r" % (pid, text)})
     emit({"event": "recv", "line": json.dumps(reply, ensure_ascii=False)})
 
@@ -561,7 +566,7 @@ async def main():
 
     cmd_q = asyncio.Queue()
     reader = asyncio.create_task(stdin_reader(cmd_q))
-    state = {"prompt_id": ""}
+    state = {"prompt_id": "", "in_prompt": False}
 
     try:
         while True:
@@ -616,6 +621,9 @@ async def main():
                         # 键盘转发：Cardputer 实体键 -> 电脑聚焦窗口
                         type_key(obj.get("key", ""))
                         continue
+                    # 用户已回复（permission/input），推送结束，恢复性能监控。
+                    if obj.get("cmd") in ("permission", "input"):
+                        state["in_prompt"] = False
                     emit({"event": "recv", "line": s})
 
             try:
