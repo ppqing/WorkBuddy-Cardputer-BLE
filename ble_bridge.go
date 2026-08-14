@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -452,7 +453,14 @@ func (b *BLEBridge) receive(line string) {
 		if err := json.Unmarshal([]byte(reply), &resp); err == nil && resp.Cmd != "" {
 			switch resp.Cmd {
 			case "permission":
-				reply = resp.Decision // "once" / "deny"
+				// choose 界面按数字键时固件发送
+				// {"decision":"once","option":N}，option 才是选项序号。
+				// 优先取 option，否则取 decision（confirm 的 once/deny）。
+				if resp.Option > 0 {
+					reply = strconv.Itoa(resp.Option)
+				} else {
+					reply = resp.Decision // "once" / "deny"
+				}
 			case "input":
 				reply = resp.Text // free text
 			}
