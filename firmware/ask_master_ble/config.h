@@ -10,4 +10,9 @@
 #define BEEP_ANSWER_FREQ  1400
 #define BEEP_ANSWER_DURATION_MS 150
 
+// 提示音音量调节（0~255，每次 ±VOLUME_STEP）
+#define VOLUME_STEP 32
+#define VOLUME_MIN 0
+#define VOLUME_MAX 255
+
 #endif

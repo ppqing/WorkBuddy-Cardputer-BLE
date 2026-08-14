@@ -605,27 +605,33 @@ void drawStandbyScreen(bool connected) {
         canvas.drawString("ask-master", 120, UI_BODY_Y + 8);
 
         if (hasMetrics) {
-            useBodyFont();
-            canvas.setTextColor(UI_RGB_FG);
-
-            // 第一行：CPU / GPU
-            char line1[48];
-            if (pcGpu >= 0) {
-                snprintf(line1, sizeof(line1), "CPU %d%%  GPU %d%%", pcCpu, pcGpu);
+            if (metricsPaused) {
+                useBodyFont();
+                canvas.setTextColor(UI_RGB_FG);
+                canvas.drawString(L("监控已暂停", "metrics paused"), 120, UI_BODY_Y + 38);
             } else {
-                snprintf(line1, sizeof(line1), "CPU %d%%", pcCpu);
+                useBodyFont();
+                canvas.setTextColor(UI_RGB_FG);
+
+                // 第一行：CPU / GPU
+                char line1[48];
+                if (pcGpu >= 0) {
+                    snprintf(line1, sizeof(line1), "CPU %d%%  GPU %d%%", pcCpu, pcGpu);
+                } else {
+                    snprintf(line1, sizeof(line1), "CPU %d%%", pcCpu);
+                }
+                canvas.drawString(line1, 120, UI_BODY_Y + 32);
+
+                // 第二行：内存
+                char line2[32];
+                snprintf(line2, sizeof(line2), L("内存 %d%%", "MEM %d%%"), pcMem);
+                canvas.drawString(line2, 120, UI_BODY_Y + 52);
+
+                // 第三行：网速（下载/上传）
+                String line3 = String(L("下", "D")) + " " + formatRate(pcNetDn) +
+                               "  " + String(L("上", "U")) + " " + formatRate(pcNetUp);
+                canvas.drawString(line3.c_str(), 120, UI_BODY_Y + 72);
             }
-            canvas.drawString(line1, 120, UI_BODY_Y + 32);
-
-            // 第二行：内存
-            char line2[32];
-            snprintf(line2, sizeof(line2), L("内存 %d%%", "MEM %d%%"), pcMem);
-            canvas.drawString(line2, 120, UI_BODY_Y + 52);
-
-            // 第三行：网速（下载/上传）
-            String line3 = String(L("下", "D")) + " " + formatRate(pcNetDn) +
-                           "  " + String(L("上", "U")) + " " + formatRate(pcNetUp);
-            canvas.drawString(line3.c_str(), 120, UI_BODY_Y + 72);
         } else {
             useBodyFont();
             canvas.setTextColor(UI_RGB_FG);
@@ -640,7 +646,16 @@ void drawStandbyScreen(bool connected) {
         canvas.drawString(L("等待蓝牙连接", "waiting for BLE"), 120, UI_BODY_Y + 58);
     }
 
-    drawFooterDim(L("[S] 设备信息  [L] 语言", "[S] Info  [L] Lang"));
+    int volLevel = (speakerVolume * 8 + 127) / 255;  // 0~8
+    char footer[96];
+    if (sysLang == "zh") {
+        snprintf(footer, sizeof(footer), "[S]信息 [W]%s [↑↓]音量%d/8 [L]语言",
+                 metricsPaused ? "恢复" : "暂停", volLevel);
+    } else {
+        snprintf(footer, sizeof(footer), "[S]Info [W]%s [^v]Vol%d/8 [L]Lang",
+                 metricsPaused ? "Resume" : "Pause", volLevel);
+    }
+    drawFooterDim(footer);
 
     canvas.pushSprite(0, 0);
 }

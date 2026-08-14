@@ -18,7 +18,7 @@ enum State {
     PAIRING
 };
 
-static constexpr const char* APP_VERSION = "Claude AskMaster v2.1.0";
+static constexpr const char* APP_VERSION = "Claude AskMaster v2.2.0";
 static constexpr const char* BLE_DEVICE_NAME = "Claude AskMaster";
 // One payload must fit here whole. UTF-8 CJK costs 3 bytes per character, so a
 // fully populated Chinese choose message (question + context + 6 options) needs
@@ -52,6 +52,8 @@ int pcMem = -1;   // 内存使用率 %
 int pcNetDn = 0;  // 下载速度 bytes/s
 int pcNetUp = 0;  // 上传速度 bytes/s
 bool hasMetrics = false;
+bool metricsPaused = false;  // W 键：暂停/恢复性能监控显示
+int speakerVolume = 192;     // 提示音音量 0~255，默认 75%
 
 // BLE 接收缓冲（可能分多次 notify 到达）
 // onBLEReceive() 运行在 NimBLE 任务上下文，handleBLEInput() 运行在主循环，
@@ -100,6 +102,11 @@ static bool backspaceHeld = false;
 static unsigned long backspaceHoldStart = 0;
 static unsigned long lastBackspaceStep = 0;
 
+// isChange() 是有状态的边沿检测，同一按键事件只能消费一次。
+// 在 loop() 里统一检测一次，供 IDLE 分支和 handleKeyboard() 共用，
+// 否则 IDLE 分支先调用 isChange() 会把边沿"吃掉"，导致 S/L 键失效。
+static bool keyChangedThisFrame = false;
+
 void onBLEReceive(const uint8_t* data, size_t len);
 void renderCurrentScreen();
 void handleKeyboard();
@@ -114,6 +121,7 @@ void updateMaxScroll();
 void handleBLEInput();
 void processLine(const String& line);
 void transitionToSleep();
+void changeVolume(int delta);
 
 #ifdef DEBUG_SERIAL
   #define DBG(...) Serial.println(__VA_ARGS__)
@@ -136,7 +144,9 @@ void setup() {
     // Load saved language preference.
     prefs.begin("ask-master", true);
     sysLang = prefs.getString("lang", "zh");
+    speakerVolume = prefs.getInt("vol", 192);
     prefs.end();
+    M5Cardputer.Speaker.setVolume(speakerVolume);
 
     drawSleepScreen();
 
@@ -163,6 +173,7 @@ void setup() {
 
 void loop() {
     M5Cardputer.update();
+    keyChangedThisFrame = M5Cardputer.Keyboard.isChange();
 
     // 处理配对显示
     if (displayPasskey) {
@@ -232,7 +243,7 @@ void loop() {
         //   Backspace → 电脑删除（立即响应 + 长按连发）
         Keyboard_Class::KeysState kst = M5Cardputer.Keyboard.keysState();
 
-        if (M5Cardputer.Keyboard.isChange() && kst.enter) {
+        if (keyChangedThisFrame && kst.enter) {
             sendKeyEvent("enter");
         }
 
@@ -455,8 +466,8 @@ void processLine(const String& message) {
         pcNetDn = doc["net_dn"].as<int>();
         pcNetUp = doc["net_up"].as<int>();
         hasMetrics = true;
-        // 待机界面实时刷新（已连接或未连接都显示最新数据）
-        if (currentState == IDLE || currentState == SLEEP) {
+        // 待机界面实时刷新（已连接或未连接都显示最新数据）；暂停时冻结显示。
+        if (!metricsPaused && (currentState == IDLE || currentState == SLEEP)) {
             drawStandbyScreen(M5Cardputer.BLE.connected());
         }
         return;
@@ -592,14 +603,17 @@ void renderCurrentScreen() {
 }
 
 void handleKeyboard() {
-    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
+    if (!keyChangedThisFrame || !M5Cardputer.Keyboard.isPressed()) {
         return;
     }
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
 
-    // 待机界面（SLEEP 未连接 / IDLE 已连接）统一按键：S 设备信息、L 语言。
+    // 待机界面（SLEEP 未连接 / IDLE 已连接）统一按键：
+    //   S 设备信息、W 暂停/恢复性能监控、L 语言、↑/↓（或 ;/.）音量
     if (currentState == SLEEP || currentState == IDLE) {
+        if (status.up) { changeVolume(+VOLUME_STEP); return; }
+        if (status.down) { changeVolume(-VOLUME_STEP); return; }
         for (char c : status.word) {
             DBG(String("standby key: ") + c);
             if (c == 's' || c == 'S') {
@@ -607,6 +621,13 @@ void handleKeyboard() {
                 drawIdleScreen(APP_VERSION, info.c_str(), false);
                 delay(1500);
                 transitionToSleep();
+                return;
+            }
+            if (c == 'w' || c == 'W') {
+                metricsPaused = !metricsPaused;
+                M5Cardputer.Speaker.tone(BEEP_ANSWER_FREQ, 60);
+                drawStandbyScreen(M5Cardputer.BLE.connected());
+                lastActivityTime = millis();
                 return;
             }
             if (c == 'l' || c == 'L') {
@@ -618,6 +639,8 @@ void handleKeyboard() {
                 transitionToSleep();
                 return;
             }
+            if (c == ';') { changeVolume(+VOLUME_STEP); return; }
+            if (c == '.') { changeVolume(-VOLUME_STEP); return; }
         }
         return;
     }
@@ -827,4 +850,20 @@ void transitionToSleep() {
     currentState = connected ? IDLE : SLEEP;
     lastActivityTime = millis();
     drawStandbyScreen(connected);
+}
+
+// 提示音音量调节：更新 Speaker 主音量、持久化、蜂鸣反馈并重绘待机界面。
+void changeVolume(int delta) {
+    speakerVolume += delta;
+    if (speakerVolume < VOLUME_MIN) speakerVolume = VOLUME_MIN;
+    if (speakerVolume > VOLUME_MAX) speakerVolume = VOLUME_MAX;
+
+    M5Cardputer.Speaker.setVolume(speakerVolume);
+    prefs.begin("ask-master", false);
+    prefs.putInt("vol", speakerVolume);
+    prefs.end();
+
+    M5Cardputer.Speaker.tone(BEEP_ANSWER_FREQ, 60);
+    drawStandbyScreen(M5Cardputer.BLE.connected());
+    lastActivityTime = millis();
 }

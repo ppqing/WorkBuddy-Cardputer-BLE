@@ -13,6 +13,10 @@ extern int pcMem;
 extern int pcNetDn;
 extern int pcNetUp;
 extern bool hasMetrics;
+// W 键切换的性能监控暂停状态。
+extern bool metricsPaused;
+// 提示音音量（0~255），方向键调节。
+extern int speakerVolume;
 // L() returns a plain const char* (not __FlashStringHelper*) so it can be
 // passed to functions expecting const char*.
 #define L(zh, en) (sysLang == "zh" ? (const char*)(zh) : (const char*)(en))
