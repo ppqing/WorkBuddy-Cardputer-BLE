@@ -116,27 +116,77 @@ def write_wav(path, samples, rate=AUDIO_SAMPLE_RATE):
 # faster-whisper transcription (lazy, cached model)
 # ---------------------------------------------------------------------------
 
+# 语音识别模型。可选 tiny/base/small/medium/large-v3。
+# 模型越大中文识别越准，但转写越慢、内存/磁盘占用越大。
+WHISPER_MODEL = "medium"
+WHISPER_DEVICE = "cuda"       # 有 NVIDIA GPU 用 cuda，否则用 cpu
+WHISPER_COMPUTE = "float16"   # GPU: float16/int8_float16；CPU: int8
+WHISPER_BEAM_SIZE = 5         # 5 质量更高（GPU 下速度足够快）
+WHISPER_LANGUAGE = "zh"
+# 简体中文引导：Whisper 中文训练数据繁体占比高，不引导容易输出繁体。
+WHISPER_INITIAL_PROMPT = "以下是普通话的句子，请使用简体中文输出。"
+
 _whisper_model = None
 _whisper_lock = threading.Lock()
+
+# 保存 os.add_dll_directory 的返回值，防止被 GC 导致 DLL 搜索路径失效。
+_cublas_dll_dirs = []
+
+
+def _setup_cuda_dll_path():
+    """Ensure ctranslate2 can load cuBLAS (cublas64_12.dll).
+
+    ctranslate2's pip wheel bundles cuDNN but NOT cuBLAS. On Windows the DLL
+    comes from the `nvidia-cublas-cu12` package (site-packages/nvidia/cublas/bin),
+    which is not on the default DLL search path. Prefer the ctranslate2 dir
+    (in case it was copied there), else add the nvidia package dir.
+    """
+    try:
+        import ctranslate2 as _ct
+
+        ct_dir = os.path.dirname(_ct.__file__)
+        if os.path.isfile(os.path.join(ct_dir, "cublas64_12.dll")):
+            return True
+    except Exception:
+        pass
+    try:
+        import site
+
+        for sp in site.getsitepackages():
+            d = os.path.join(sp, "nvidia", "cublas", "bin")
+            if os.path.isfile(os.path.join(d, "cublas64_12.dll")):
+                handle = os.add_dll_directory(d)
+                _cublas_dll_dirs.append(handle)  # 保持引用
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _load_model():
+    """Import faster_whisper and load the model (call under _whisper_lock)."""
+    global _whisper_model
+    if _whisper_model is not None:
+        return
+    _setup_cuda_dll_path()
+    from faster_whisper import WhisperModel
+
+    _whisper_model = WhisperModel(
+        WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
+    )
 
 
 def _preload_model():
     """Load the whisper model in the background at startup.
 
-    Importing faster-whisper + loading the tiny model takes several seconds
-    (and holds the GIL/import locks). Doing it eagerly here avoids a long
-    stall (and a concurrent-import deadlock) on the first voice capture.
+    Importing faster-whisper + loading the model takes several seconds (and
+    holds the GIL/import locks). Doing it eagerly here avoids a long stall
+    (and a concurrent-import deadlock) on the first voice capture.
     """
-    global _whisper_model
     try:
         with _whisper_lock:
-            if _whisper_model is None:
-                from faster_whisper import WhisperModel
-
-                _whisper_model = WhisperModel(
-                    "tiny", device="cpu", compute_type="int8"
-                )
-        emit({"event": "log", "msg": "whisper: model preloaded"})
+            _load_model()
+        emit({"event": "log", "msg": "whisper: model preloaded (%s/%s)" % (WHISPER_DEVICE, WHISPER_COMPUTE)})
     except Exception as e:
         import traceback
 
@@ -146,17 +196,15 @@ def _preload_model():
 
 def transcribe(path):
     """Transcribe a wav file. Returns text, or None if whisper is unavailable."""
-    global _whisper_model
     try:
         with _whisper_lock:
-            if _whisper_model is None:
-                from faster_whisper import WhisperModel
-
-                _whisper_model = WhisperModel(
-                    "tiny", device="cpu", compute_type="int8"
-                )
+            _load_model()
             segments, _info = _whisper_model.transcribe(
-                path, language=None, beam_size=1, vad_filter=True
+                path,
+                language=WHISPER_LANGUAGE,
+                beam_size=WHISPER_BEAM_SIZE,
+                initial_prompt=WHISPER_INITIAL_PROMPT,
+                vad_filter=True,
             )
             return "".join(s.text for s in segments).strip()
     except Exception as e:
