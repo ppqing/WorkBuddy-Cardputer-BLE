@@ -569,26 +569,47 @@ void drawIdleScreen(const char* version, const char* ip, bool showSetupHint) {
 }
 
 // ============================================================================
-// SLEEP
+// STANDBY（统一待机界面：未连接 / 已连接共用同一界面）
 // ============================================================================
-void drawSleepScreen() {
+void drawStandbyScreen(bool connected) {
     initCanvasIfNeeded();
     canvas.fillSprite(UI_RGB_BG);
 
-    drawStatusBar(L("休眠", "SLEEP"), ACC_IDLE, false);
+    // 状态栏统一为「待机」，圆点/在线文字随连接状态变化。
+    drawStatusBar(L("待机", "IDLE"), ACC_IDLE, connected);
 
     useDisplayFont();
     canvas.setTextColor(cMid());
     canvas.setTextDatum(middle_center);
-    canvas.drawString("zZz", 120, UI_BODY_Y + 20);
 
-    useChromeFont();
-    canvas.setTextColor(cDim());
-    canvas.drawString(L("等待蓝牙连接", "waiting for BLE"), 120, UI_BODY_Y + 58);
+    if (connected) {
+        // 已连接：显示就绪
+        useChromeFont();
+        canvas.setTextColor(cDim());
+        canvas.drawString("ask-master", 120, UI_BODY_Y + 12);
+
+        useBodyFont();
+        canvas.setTextColor(UI_RGB_FG);
+        canvas.drawString(L("就绪", "ready"), 120, UI_BODY_Y + 38);
+    } else {
+        // 未连接：等待蓝牙连接
+        canvas.drawString("zZz", 120, UI_BODY_Y + 20);
+
+        useChromeFont();
+        canvas.setTextColor(cDim());
+        canvas.drawString(L("等待蓝牙连接", "waiting for BLE"), 120, UI_BODY_Y + 58);
+    }
 
     drawFooterDim(L("[S] 设备信息  [L] 语言", "[S] Info  [L] Lang"));
 
     canvas.pushSprite(0, 0);
+}
+
+// ============================================================================
+// SLEEP（向后兼容：统一待机界面的未连接分支）
+// ============================================================================
+void drawSleepScreen() {
+    drawStandbyScreen(false);
 }
 
 // ============================================================================
@@ -843,7 +864,8 @@ void drawRecordingScreen(unsigned long elapsedMs) {
     initCanvasIfNeeded();
     canvas.fillSprite(UI_RGB_BG);
 
-    drawStatusBar(L("语音输入", "VOICE"), ACC_ESCALATE, false);
+    // 录音只在 BLE 已连接时发生，状态栏应显示「在线」而非「离线」。
+    drawStatusBar(L("语音输入", "VOICE"), ACC_ESCALATE, true);
 
     int cx = 120;
     int cy = 54;

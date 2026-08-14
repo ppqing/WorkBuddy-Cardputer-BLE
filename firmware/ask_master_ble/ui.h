@@ -10,6 +10,8 @@ extern String sysLang;
 #define L(zh, en) (sysLang == "zh" ? (const char*)(zh) : (const char*)(en))
 
 void drawIdleScreen(const char* version, const char* ip, bool showSetupHint);
+// 统一待机界面：未连接/已连接共用同一界面，仅状态栏圆点、正文内容不同。
+void drawStandbyScreen(bool connected);
 void drawSetupScreen(const char* label, const char* context, const char* inputBuffer);
 void drawSetupSummaryScreen(const char* ssid, const char* serverIP, uint16_t port);
 void drawNetworkListScreen(const String networks[], int networkCount, int8_t rssi[]);

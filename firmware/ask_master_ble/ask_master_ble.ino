@@ -564,9 +564,10 @@ void handleKeyboard() {
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
 
-    if (currentState == SLEEP) {
+    // 待机界面（SLEEP 未连接 / IDLE 已连接）统一按键：S 设备信息、L 语言。
+    if (currentState == SLEEP || currentState == IDLE) {
         for (char c : status.word) {
-            DBG(String("SLEEP key: ") + c);
+            DBG(String("standby key: ") + c);
             if (c == 's' || c == 'S') {
                 String info = L("蓝牙名称: ", "BLE: ") + String(BLE_DEVICE_NAME);
                 drawIdleScreen(APP_VERSION, info.c_str(), false);
@@ -764,7 +765,7 @@ void clearCurrentPrompt() {
 }
 
 void drawIdle() {
-    drawIdleScreen(APP_VERSION, L("蓝牙已连接", "BLE connected"), true);
+    drawStandbyScreen(true);
 }
 
 void updateMaxScroll() {
@@ -775,15 +776,10 @@ void updateMaxScroll() {
 }
 
 void transitionToSleep() {
-    // 根据实际 BLE 连接状态决定去向，避免「已连接却显示等待连接」的矛盾：
-    //   已连接 → IDLE（就绪）
-    //   未连接 → SLEEP（等待蓝牙连接）
-    if (M5Cardputer.BLE.connected()) {
-        currentState = IDLE;
-        lastActivityTime = millis();
-        drawIdle();
-    } else {
-        currentState = SLEEP;
-        drawSleepScreen();
-    }
+    // 根据实际 BLE 连接状态决定去向，避免「已连接却显示等待连接」的矛盾。
+    // 界面统一后，两个状态共用同一待机界面，仅圆点/正文不同。
+    bool connected = M5Cardputer.BLE.connected();
+    currentState = connected ? IDLE : SLEEP;
+    lastActivityTime = millis();
+    drawStandbyScreen(connected);
 }
