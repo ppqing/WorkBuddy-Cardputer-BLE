@@ -42,8 +42,14 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
 import wave
+
+try:
+    import ctypes
+except ImportError:  # pragma: no cover - only on non-Windows
+    ctypes = None
 
 DEVICE_NAME = "Claude AskMaster"
 RX_CHAR = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -111,22 +117,48 @@ def write_wav(path, samples, rate=AUDIO_SAMPLE_RATE):
 # ---------------------------------------------------------------------------
 
 _whisper_model = None
+_whisper_lock = threading.Lock()
+
+
+def _preload_model():
+    """Load the whisper model in the background at startup.
+
+    Importing faster-whisper + loading the tiny model takes several seconds
+    (and holds the GIL/import locks). Doing it eagerly here avoids a long
+    stall (and a concurrent-import deadlock) on the first voice capture.
+    """
+    global _whisper_model
+    try:
+        with _whisper_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
+
+                _whisper_model = WhisperModel(
+                    "tiny", device="cpu", compute_type="int8"
+                )
+        emit({"event": "log", "msg": "whisper: model preloaded"})
+    except Exception as e:
+        import traceback
+
+        emit({"event": "log", "msg": "whisper preload error: %r" % e})
+        emit({"event": "log", "msg": "whisper preload traceback: %s" % traceback.format_exc()})
 
 
 def transcribe(path):
     """Transcribe a wav file. Returns text, or None if whisper is unavailable."""
     global _whisper_model
     try:
-        if _whisper_model is None:
-            from faster_whisper import WhisperModel
+        with _whisper_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
 
-            _whisper_model = WhisperModel(
-                "tiny", device="cpu", compute_type="int8"
+                _whisper_model = WhisperModel(
+                    "tiny", device="cpu", compute_type="int8"
+                )
+            segments, _info = _whisper_model.transcribe(
+                path, language=None, beam_size=1, vad_filter=True
             )
-        segments, _info = _whisper_model.transcribe(
-            path, language=None, beam_size=1, vad_filter=True
-        )
-        return "".join(s.text for s in segments).strip()
+            return "".join(s.text for s in segments).strip()
     except Exception as e:
         emit({"event": "log", "msg": "whisper error: %r" % e})
         return None
@@ -209,18 +241,150 @@ async def pump(client, cmd_q, state):
             return  # treat write failure as a dropped link
 
 
+def _setup_win32_types(user32, kernel32):
+    """Declare Win32 API signatures.
+
+    ctypes defaults return types to 32-bit c_int, which truncates the 64-bit
+    HGLOBAL/pointer values returned by GlobalAlloc/GlobalLock, producing a
+    wild pointer and an access-violation crash. Declaring c_void_p fixes it.
+    """
+    # HGLOBAL GlobalAlloc(UINT uFlags, SIZE_T dwBytes)
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    # LPVOID GlobalLock(HGLOBAL hMem)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    # BOOL GlobalUnlock(HGLOBAL hMem)
+    kernel32.GlobalUnlock.restype = ctypes.c_int
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    # HGLOBAL GlobalFree(HGLOBAL hMem)
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+
+    # BOOL OpenClipboard(HWND hWndNewOwner)
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    # BOOL EmptyClipboard(VOID)
+    user32.EmptyClipboard.restype = ctypes.c_int
+    # HANDLE SetClipboardData(UINT uFormat, HANDLE hMem)
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    # BOOL CloseClipboard(VOID)
+    user32.CloseClipboard.restype = ctypes.c_int
+
+
+def type_text_to_focused_window(text):
+    """Paste `text` into the currently focused window.
+
+    Uses clipboard + Ctrl+V (the only reliable way to input arbitrary text,
+    including CJK). Windows-only; returns True on success.
+    """
+    if not text:
+        return False
+    if ctypes is None or os.name != "nt":
+        emit({"event": "log", "msg": "keyboard paste: only supported on Windows"})
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        _setup_win32_types(user32, kernel32)
+
+        # 1) 写入剪贴板（CF_UNICODETEXT）
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+        if not user32.OpenClipboard(None):
+            emit({"event": "log", "msg": "keyboard paste: OpenClipboard failed"})
+            return False
+        try:
+            user32.EmptyClipboard()
+            wtext = text.encode("utf-16-le") + b"\x00\x00"
+            hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(wtext))
+            if not hmem:
+                raise OSError("GlobalAlloc failed")
+            p = kernel32.GlobalLock(hmem)
+            if not p:
+                kernel32.GlobalFree(hmem)
+                raise OSError("GlobalLock failed")
+            try:
+                ctypes.memmove(p, wtext, len(wtext))
+            finally:
+                kernel32.GlobalUnlock(hmem)
+            if not user32.SetClipboardData(CF_UNICODETEXT, hmem):
+                kernel32.GlobalFree(hmem)
+                raise OSError("SetClipboardData failed")
+        finally:
+            user32.CloseClipboard()
+
+        # 2) 模拟 Ctrl+V
+        time.sleep(0.05)
+        VK_CONTROL = 0x11
+        VK_V = 0x56
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+        emit({"event": "log", "msg": "keyboard paste: %d chars typed" % len(text)})
+        return True
+    except Exception as e:
+        emit({"event": "log", "msg": "keyboard paste error: %r" % e})
+        return False
+
+
+def type_key(key):
+    """Simulate a single keypress on the currently focused window.
+
+    Used by the "keyboard forwarding" feature: when the device is idle
+    (BLE connected, no prompt), its Enter/Backspace keys are forwarded
+    here and injected into the focused window. Windows-only.
+    """
+    if ctypes is None or os.name != "nt":
+        return False
+    VK_MAP = {
+        "enter": 0x0D,
+        "backspace": 0x08,
+    }
+    vk = VK_MAP.get(key)
+    if vk is None:
+        emit({"event": "log", "msg": "key: unknown key %r" % key})
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(vk, 0, 0, 0)
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        emit({"event": "log", "msg": "key: pressed %r" % key})
+        return True
+    except Exception as e:
+        emit({"event": "log", "msg": "key error: %r" % e})
+        return False
+
+
 async def process_audio_end(adpcm, meta, state):
-    """Decode the recorded ADPCM, save it, transcribe, and reply as input."""
+    """Decode the recorded ADPCM, save it, transcribe, and route the result.
+
+    - mode == "keyboard": paste the transcription into the focused window
+      (no reply back to the daemon).
+    - otherwise (prompt mode): reply to the pending prompt as normal input.
+    """
     samples = adpcm_decode(adpcm)
     ts = time.strftime("%Y%m%d-%H%M%S")
     wav_path = os.path.join(AUDIO_DIR, "voice-%s.wav" % ts)
     write_wav(wav_path, samples)
     emit({"event": "log", "msg": "voice captured: %d samples -> %s" % (len(samples), wav_path)})
 
-    pid = state.get("prompt_id") or ""
     loop = asyncio.get_running_loop()
     text = await loop.run_in_executor(None, transcribe, wav_path)
 
+    # 键盘输入模式：转写结果直接输入电脑聚焦窗口，不回传 agent。
+    if meta.get("mode") == "keyboard":
+        if text:
+            await loop.run_in_executor(None, type_text_to_focused_window, text)
+        else:
+            emit({"event": "log", "msg": "keyboard paste: no transcription"})
+        return
+
+    pid = state.get("prompt_id") or ""
     if text:
         reply = {"cmd": "input", "id": pid, "text": text}
     else:
@@ -235,6 +399,15 @@ async def process_audio_end(adpcm, meta, state):
 async def main():
     _force_utf8_stdio()
     emit({"event": "ready"})
+
+    # 必须在 BLE(WinRT) 初始化之前加载 faster-whisper：
+    # 它依赖的 PyTorch c10.dll 在 WinRT/BLE 组件活跃时会加载失败
+    # (WinError 1114: 动态链接库初始化例程失败)。用 executor 加载并等待
+    # 完成，既避免阻塞事件循环，又保证 torch 先于 BLE 加载。
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _preload_model)
+    except Exception:
+        pass
 
     try:
         from bleak import BleakClient, BleakScanner
@@ -291,6 +464,10 @@ async def main():
                         payload = bytes(audio_buf)
                         audio_buf = bytearray()
                         asyncio.ensure_future(process_audio_end(payload, obj, state))
+                        continue
+                    if obj and obj.get("evt") == "key":
+                        # 键盘转发：Cardputer 实体键 -> 电脑聚焦窗口
+                        type_key(obj.get("key", ""))
                         continue
                     emit({"event": "recv", "line": s})
 

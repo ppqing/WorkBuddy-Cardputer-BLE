@@ -85,6 +85,12 @@ static int scrollHeldDir = 0;  // -1 上, +1 下, 0 未按住
 static unsigned long scrollHoldStart = 0;
 static unsigned long lastScrollStep = 0;
 
+// 键盘转发（IDLE 状态）：Cardputer 实体键映射到电脑聚焦窗口。
+// Backspace 长按连发，复用滚动长按的延时/连发参数。
+static bool backspaceHeld = false;
+static unsigned long backspaceHoldStart = 0;
+static unsigned long lastBackspaceStep = 0;
+
 void onBLEReceive(const uint8_t* data, size_t len);
 void renderCurrentScreen();
 void handleKeyboard();
@@ -92,6 +98,7 @@ bool handleScrollKeys();
 void sendReply(const String& reply);
 void sendPermission(const String& id, const String& decision, int option);
 void sendInput(const String& id, const String& text);
+void sendKeyEvent(const String& key);
 void clearCurrentPrompt();
 void drawIdle();
 void updateMaxScroll();
@@ -171,16 +178,21 @@ void loop() {
 
     handleBLEInput();
 
-    // P1 语音输入：WAITING_INPUT(ask/escalate) 状态下按住 Ctrl 说话，
-    // 松开 Ctrl 结束录音并发送 audio_end（PC 端转写后回 input 回复）。
+    // P1 语音输入：按住 Ctrl 说话，松开 Ctrl 结束录音并发送 audio_end。
+    // 两种触发场景：
+    //   1) WAITING_INPUT(ask/escalate)：prompt 模式，PC 端转写后回 input 回复。
+    //   2) IDLE（已连接无 prompt）：keyboard 模式，PC 端转写后直接输入电脑聚焦窗口。
     audioTick();  // 未录音时是 no-op
 
-    if (currentState == WAITING_INPUT &&
-        (currentType == "ask" || currentType == "escalate")) {
+    bool promptVoice = (currentState == WAITING_INPUT &&
+                        (currentType == "ask" || currentType == "escalate"));
+    bool keyboardVoice = (currentState == IDLE);
+
+    if (promptVoice || keyboardVoice) {
         Keyboard_Class::KeysState kst = M5Cardputer.Keyboard.keysState();
         if (kst.ctrl) {
             if (!audioCapturing()) {
-                audioBeginCapture();
+                audioBeginCapture(keyboardVoice);
             }
             drawRecordingScreen(audioCapturedMillis());
             yield();
@@ -190,7 +202,11 @@ void loop() {
     if (audioCapturing()) {
         // Ctrl 已松开：结束本次录音
         audioEndCapture();
-        transitionToSleep();
+        if (currentState == IDLE) {
+            drawIdle();           // keyboard 模式：回到 IDLE 待机画面
+        } else {
+            transitionToSleep();  // prompt 模式：原有行为
+        }
         return;
     }
 
@@ -198,6 +214,31 @@ void loop() {
         if (millis() - lastIdleRedraw > IDLE_REDRAW_MS) {
             lastIdleRedraw = millis();
             drawIdle();
+        }
+
+        // 键盘转发：IDLE 状态下 Cardputer 实体键映射到电脑聚焦窗口。
+        //   Enter     → 电脑回车（新按下触发一次，不连发）
+        //   Backspace → 电脑删除（立即响应 + 长按连发）
+        Keyboard_Class::KeysState kst = M5Cardputer.Keyboard.keysState();
+
+        if (M5Cardputer.Keyboard.isChange() && kst.enter) {
+            sendKeyEvent("enter");
+        }
+
+        if (kst.backspace) {
+            unsigned long now = millis();
+            if (!backspaceHeld) {
+                backspaceHeld = true;
+                backspaceHoldStart = now;
+                lastBackspaceStep = 0;
+                sendKeyEvent("backspace");  // 首次立即响应
+            } else if (now - backspaceHoldStart > SCROLL_REPEAT_DELAY_MS &&
+                       now - lastBackspaceStep > SCROLL_REPEAT_RATE_MS) {
+                lastBackspaceStep = now;
+                sendKeyEvent("backspace");  // 长按连发
+            }
+        } else {
+            backspaceHeld = false;
         }
     }
 
@@ -655,6 +696,14 @@ void sendPermission(const String& id, const String& decision, int option) {
     transitionToSleep();
 }
 
+// 键盘转发：IDLE 状态下把 Cardputer 实体键映射到电脑聚焦窗口。
+// key 取值："enter" / "backspace"。PC 端收到后模拟对应按键。
+void sendKeyEvent(const String& key) {
+    String json = "{\"evt\":\"key\",\"key\":\"" + key + "\"}\n";
+    M5Cardputer.BLE.send(json);
+    DBG("key event: " + key);
+}
+
 // 发送自由文本（扩展命令）
 void sendInput(const String& id, const String& text) {
     currentState = SENDING;
@@ -726,6 +775,15 @@ void updateMaxScroll() {
 }
 
 void transitionToSleep() {
-    currentState = SLEEP;
-    drawSleepScreen();
+    // 根据实际 BLE 连接状态决定去向，避免「已连接却显示等待连接」的矛盾：
+    //   已连接 → IDLE（就绪）
+    //   未连接 → SLEEP（等待蓝牙连接）
+    if (M5Cardputer.BLE.connected()) {
+        currentState = IDLE;
+        lastActivityTime = millis();
+        drawIdle();
+    } else {
+        currentState = SLEEP;
+        drawSleepScreen();
+    }
 }

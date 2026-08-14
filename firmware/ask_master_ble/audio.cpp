@@ -92,6 +92,7 @@ static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
 
 static bool micInitialized = false;
 static bool capturing = false;
+static bool captureKeyboardMode = false;
 static unsigned long captureStartMs = 0;
 static unsigned long totalSamples = 0;
 static uint32_t seq = 0;
@@ -122,24 +123,26 @@ unsigned long audioCapturedMillis() {
     return (millis() - captureStartMs);
 }
 
-void audioBeginCapture() {
+void audioBeginCapture(bool keyboardMode) {
     if (capturing) return;
     if (!micInitialized && !audioInit()) return;
     capturing = true;
+    captureKeyboardMode = keyboardMode;
     captureStartMs = millis();
     totalSamples = 0;
     seq = 0;
     ima = IMAEncoder();
-    DBG("audio: capture start");
+    DBG("audio: capture start (mode=%s)", keyboardMode ? "keyboard" : "prompt");
 }
 
 void audioEndCapture() {
     if (!capturing) return;
     capturing = false;
     snprintf(frameBuf, sizeof(frameBuf),
-             "{\"evt\":\"audio_end\",\"seq\":%lu,\"len\":%lu,\"rate\":%u}\n",
+             "{\"evt\":\"audio_end\",\"seq\":%lu,\"len\":%lu,\"rate\":%u,\"mode\":\"%s\"}\n",
              (unsigned long)(seq > 0 ? seq - 1 : 0), (unsigned long)totalSamples,
-             (unsigned)AUDIO_SAMPLE_RATE);
+             (unsigned)AUDIO_SAMPLE_RATE,
+             captureKeyboardMode ? "keyboard" : "prompt");
     M5Cardputer.BLE.send(frameBuf);
     DBG("audio: capture end, samples=" + String(totalSamples));
     ima = IMAEncoder();
