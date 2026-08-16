@@ -117,6 +117,33 @@ def call_tool(tool_name, arguments, timeout_ms=60000):
         conn.close()
 
 
+def _parse_flag(name, default=""):
+    """Return the value of --<name> from sys.argv, or default."""
+    if name in sys.argv:
+        idx = sys.argv.index(name)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return default
+
+
+_KNOWN_FLAGS = {"--context"}
+
+
+def _collect_positional(start):
+    """Return positional args from sys.argv[start:] skipping known flags and their values."""
+    result = []
+    skip = 0
+    for i, a in enumerate(sys.argv[start:]):
+        if skip > 0:
+            skip -= 1
+            continue
+        if a in _KNOWN_FLAGS:
+            skip = 1
+            continue
+        result.append(a)
+    return result
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__, file=sys.stderr)
@@ -124,24 +151,27 @@ def main():
 
     tool = sys.argv[1]
     args = {}
+    context = _parse_flag("--context")
 
     if tool == "confirm":
         args["statement"] = sys.argv[2]
         if len(sys.argv) > 3:
             args["consequence"] = sys.argv[3]
+        if context:
+            args["context"] = context
     elif tool == "choose":
         args["question"] = sys.argv[2]
-        args["options"] = sys.argv[3:]
-        if not args["options"]:
+        if context:
+            args["context"] = context
+        opts = _collect_positional(3)
+        if not opts:
             print("error: choose requires at least 2 options", file=sys.stderr)
             sys.exit(1)
+        args["options"] = opts
     elif tool in ("ask-human", "escalate"):
         args["question"] = sys.argv[2]
-        # Parse --context
-        if "--context" in sys.argv:
-            idx = sys.argv.index("--context")
-            if idx + 1 < len(sys.argv):
-                args["context"] = sys.argv[idx + 1]
+        if context:
+            args["context"] = context
     else:
         print(f"unknown tool: {tool}", file=sys.stderr)
         print("Valid: confirm, choose, ask-human, escalate", file=sys.stderr)
