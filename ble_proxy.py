@@ -560,13 +560,20 @@ async def process_audio_end(adpcm, meta, state):
     samples = adpcm_decode(adpcm)
     ts = time.strftime("%Y%m%d-%H%M%S")
     wav_path = os.path.join(AUDIO_DIR, "voice-%s.wav" % ts)
-    write_wav(wav_path, samples)
-    emit({"event": "log", "msg": "voice captured: %d samples -> %s" % (len(samples), wav_path)})
 
-    loop = asyncio.get_running_loop()
-    emit({"event": "log", "msg": "transcribe start: mode=%s" % meta.get("mode")})
-    text = await loop.run_in_executor(None, transcribe, wav_path)
-    emit({"event": "log", "msg": "transcribe done: text=%r" % (text,)})
+    # 检查原始音频能量：如果峰值太低说明没人说话，跳过转写避免 whisper 幻觉
+    raw_peak = max(abs(s) for s in samples) if samples else 0
+    if raw_peak < 500:
+        emit({"event": "log", "msg": "silence detected (peak=%d), skipping transcription" % raw_peak})
+        text = ""
+    else:
+        write_wav(wav_path, samples)
+        emit({"event": "log", "msg": "voice captured: %d samples -> %s" % (len(samples), wav_path)})
+
+        loop = asyncio.get_running_loop()
+        emit({"event": "log", "msg": "transcribe start: mode=%s" % meta.get("mode")})
+        text = await loop.run_in_executor(None, transcribe, wav_path)
+        emit({"event": "log", "msg": "transcribe done: text=%r" % (text,)})
 
     # 键盘输入模式：转写结果直接输入电脑聚焦窗口，不回传 agent。
     if meta.get("mode") == "keyboard":
