@@ -109,8 +109,17 @@ bool audioInit() {
     // Mic.begin() 负责 I2S_NUM_0（BCLK=41/WS=43/DIN=46）初始化 + codec 上电。
     if (!M5Cardputer.Mic.begin()) return false;
     M5Cardputer.Mic.setSampleRate(AUDIO_SAMPLE_RATE);
+
+    // 提高麦克风增益：默认 magnification=16（实际增益=16/(2×2)=4倍），
+    // 改为 64（实际增益=64/4=16倍），补偿 ES8311 ADC 硬件增益偏低的设置。
+    {
+        auto cfg = M5Cardputer.Mic.config();
+        cfg.magnification = 64;
+        M5Cardputer.Mic.config(cfg);
+    }
+
     micInitialized = true;
-    DBG("audio: mic ready (16kHz mono)");
+    DBG("audio: mic ready (16kHz mono, gain=16x)");
     return true;
 }
 

@@ -107,8 +107,25 @@ def adpcm_decode(data):
     return out
 
 
+def normalize_audio(samples):
+    """Normalize PCM samples to [-32767, 32767] full scale (peak normalization).
+    Returns a new list of int16; if the signal is already near full scale or
+    completely silent, returns the original unchanged."""
+    if not samples:
+        return samples
+    peak = max(abs(s) for s in samples)
+    if peak < 1024:              # 信号太弱，直接放大到 -16000~16000 范围避免 whisper VAD 过滤
+        factor = 16000.0 / max(peak, 1)
+        return [max(-32768, min(32767, int(s * factor))) for s in samples]
+    if peak < 28000:             # 中等音量，归一化到 -31000~31000
+        factor = 31000.0 / peak
+        return [int(s * factor) for s in samples]
+    return samples               # 已经够响，不动
+
+
 def write_wav(path, samples, rate=AUDIO_SAMPLE_RATE):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    samples = normalize_audio(samples)
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -129,21 +146,26 @@ def _resolve_model_path():
 
     Priority:
       1. ASK_MASTER_WHISPER_MODEL env var (explicit override)
-      2. <exe dir>/models/faster-whisper-small   (set by the Go bridge)
-      3. <script dir>/models/faster-whisper-small (dev: script sits next to exe)
-      4. <cwd>/models/faster-whisper-small       (daemon_keeper.py fallback)
-      5. "small"  (download from Hugging Face, needs network)
+      2. <exe dir>/models/faster-whisper-medium   (set by the Go bridge)
+      3. <exe dir>/models/faster-whisper-small    (fallback for old installs)
+      4. <script dir>/models/faster-whisper-medium (dev: script sits next to exe)
+      5. <cwd>/models/faster-whisper-medium       (daemon_keeper.py fallback)
+      6. "medium"  (download from Hugging Face, needs network)
     """
+    base = os.environ.get("ASK_MASTER_BLE_DIR", "")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
     candidates = [
         os.environ.get("ASK_MASTER_WHISPER_MODEL"),
-        os.path.join(os.environ.get("ASK_MASTER_BLE_DIR", ""), "models", "faster-whisper-small"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "faster-whisper-small"),
-        os.path.join(os.getcwd(), "models", "faster-whisper-small"),
+        os.path.join(base, "models", "faster-whisper-medium"),
+        os.path.join(base, "models", "faster-whisper-small"),
+        os.path.join(script_dir, "models", "faster-whisper-medium"),
+        os.path.join(cwd, "models", "faster-whisper-medium"),
     ]
     for c in candidates:
         if c and os.path.isdir(c):
             return c
-    return "small"
+    return "medium"
 
 WHISPER_MODEL = _resolve_model_path()
 WHISPER_DEVICE = "cuda"       # 有 NVIDIA GPU 用 cuda，否则用 cpu
@@ -231,7 +253,9 @@ def transcribe(path):
                 language=WHISPER_LANGUAGE,
                 beam_size=WHISPER_BEAM_SIZE,
                 initial_prompt=WHISPER_INITIAL_PROMPT,
-                vad_filter=True,
+                # 关闭 VAD 过滤，避免低音量音频被静默丢弃。
+                # 音频归一化已在 write_wav 中完成，无需 VAD 再次过滤。
+                vad_filter=False,
             )
             return "".join(s.text for s in segments).strip()
     except Exception as e:
@@ -567,6 +591,169 @@ async def process_audio_end(adpcm, meta, state):
     emit({"event": "recv", "line": json.dumps(reply, ensure_ascii=False)})
 
 
+# ---------------------------------------------------------------------------
+# MCP TCP server — 让 AI 助手（Trae）可以直接通过 Cardputer 提问
+# ---------------------------------------------------------------------------
+
+MCP_TCP_ADDR = "127.0.0.1"
+MCP_TCP_PORT = 51937
+
+
+async def handle_mcp_client(reader, writer, cmd_q, shared_state):
+    """Handle one MCP client connection over TCP (JSON-RPC 2.0).
+
+    shared_state is the main() state dict (with "mcp_reply_future" key) so
+    the on_notify callback can resolve the future that this handler awaits.
+    """
+    peer = writer.get_extra_info("peername")
+    emit({"event": "log", "msg": "MCP client connected: %s" % (peer,)})
+
+    async def send_jsonrpc(msg):
+        writer.write((json.dumps(msg) + "\n").encode("utf-8"))
+        await writer.drain()
+
+    async def handle_mcp_line(line):
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            return
+
+        req_id = msg.get("id")
+        method = msg.get("method")
+
+        if method == "initialize":
+            await send_jsonrpc({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "ask-master", "version": "1.0"},
+                },
+            })
+            return
+
+        if method == "notifications/initialized":
+            return
+
+        if method == "tools/call":
+            params = msg.get("params", {})
+            tool_name = params.get("name", "")
+            args = params.get("arguments", {})
+            timeout_ms = args.get("timeout", 60000)
+
+            # Build prompt payload
+            prompt_id = "mcp_%d" % int(time.time() * 1000)
+            if tool_name == "confirm":
+                prompt = {
+                    "type": "prompt",
+                    "prompt": {
+                        "id": prompt_id,
+                        "tool": "confirm",
+                        "hint": (args.get("statement", "") or "")[:200],
+                        "context": (args.get("consequence", "") or "")[:120],
+                    },
+                }
+            elif tool_name == "choose":
+                opts = [str(o)[:80] for o in (args.get("options", []) or [])[:5]]
+                prompt = {
+                    "type": "prompt",
+                    "prompt": {
+                        "id": prompt_id,
+                        "tool": "choose",
+                        "hint": (args.get("question", "") or "")[:200],
+                        "context": (args.get("context", "") or "")[:120],
+                        "options": opts,
+                    },
+                }
+            elif tool_name in ("ask-human", "escalate-to-human"):
+                prompt = {
+                    "type": "prompt",
+                    "prompt": {
+                        "id": prompt_id,
+                        "tool": tool_name,
+                        "hint": (args.get("question", "") or "")[:200],
+                        "context": (args.get("context", "") or "")[:120],
+                        "input": True,
+                    },
+                }
+                if tool_name == "escalate-to-human":
+                    prompt["prompt"]["escalated"] = True
+            else:
+                await send_jsonrpc({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32601, "message": "Method not found: %s" % tool_name},
+                })
+                return
+
+            # Create a future and store it in shared_state so on_notify
+            # can resolve it when the device replies.
+            fut = asyncio.get_running_loop().create_future()
+            shared_state["mcp_reply_future"] = fut
+
+            # Send the prompt to the BLE device via the command queue.
+            payload = json.dumps(prompt, ensure_ascii=False)
+            await cmd_q.put({"cmd": "send", "payload": payload})
+
+            # Wait for the device reply (with timeout).
+            try:
+                reply_text = await asyncio.wait_for(fut, timeout=timeout_ms / 1000.0)
+            except asyncio.TimeoutError:
+                hint = prompt["prompt"]["hint"]
+                reply_text = ("[CARDPUTER TIMEOUT] NOT confirmed: %s" if tool_name == "confirm"
+                              else "[CARDPUTER TIMEOUT] Please answer manually: %s") % hint
+            except Exception:
+                reply_text = "[CARDPUTER ERROR] Device disconnected"
+            finally:
+                if shared_state.get("mcp_reply_future") is fut:
+                    shared_state["mcp_reply_future"] = None
+
+            await send_jsonrpc({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"content": [{"type": "text", "text": reply_text}], "isError": False},
+            })
+            return
+
+        # Unknown method
+        if req_id:
+            await send_jsonrpc({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": "Method not found"},
+            })
+
+    buf = b""
+    try:
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line_str = line.decode("utf-8", "replace").strip()
+                if line_str:
+                    await handle_mcp_line(line_str)
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        emit({"event": "log", "msg": "MCP client disconnected: %s" % (peer,)})
+        writer.close()
+
+
+async def mcp_server(cmd_q, shared_state):
+    """Run MCP TCP server on port 51937."""
+    server = await asyncio.start_server(
+        lambda r, w: handle_mcp_client(r, w, cmd_q, shared_state),
+        MCP_TCP_ADDR, MCP_TCP_PORT,
+    )
+    emit({"event": "log", "msg": "MCP TCP server listening on %s:%d" % (MCP_TCP_ADDR, MCP_TCP_PORT)})
+    async with server:
+        await server.serve_forever()
+
+
 async def main():
     _force_utf8_stdio()
     emit({"event": "ready"})
@@ -589,7 +776,10 @@ async def main():
 
     cmd_q = asyncio.Queue()
     reader = asyncio.create_task(stdin_reader(cmd_q))
-    state = {"prompt_id": "", "in_prompt": False}
+    state = {"prompt_id": "", "in_prompt": False, "mcp_reply_future": None}
+
+    # Start MCP TCP server in background
+    mcp_task = asyncio.create_task(mcp_server(cmd_q, state))
 
     try:
         while True:
@@ -647,10 +837,29 @@ async def main():
                     # 用户已回复（permission/input），推送结束，恢复性能监控。
                     if obj.get("cmd") in ("permission", "input"):
                         state["in_prompt"] = False
+                        # Resolve MCP reply future if one is pending
+                        fut = state.get("mcp_reply_future")
+                        if fut and not fut.done():
+                            if obj.get("cmd") == "permission":
+                                opt = obj.get("option", 0)
+                                if opt:
+                                    fut.set_result(str(opt))
+                                else:
+                                    fut.set_result(obj.get("decision", "once"))
+                            else:
+                                fut.set_result(obj.get("text", ""))
+                            state["mcp_reply_future"] = None
                     emit({"event": "recv", "line": s})
 
             try:
                 async with BleakClient(device.address) as client:
+                    # Request maximum MTU so audio frames (~400 bytes) fit in a
+                    # single notification instead of being split into ~20 chunks
+                    # (the default MTU of 23 causes serialisation issues).
+                    try:
+                        await client.request_mtu(512)
+                    except Exception:
+                        pass  # non-fatal; MTU will stay at 23
                     # Subscribe before announcing the link so no reply is missed.
                     await client.start_notify(TX_CHAR, on_notify)
                     emit({"event": "connected", "connected": True})
@@ -664,6 +873,7 @@ async def main():
             emit({"event": "connected", "connected": False})
             await asyncio.sleep(RETRY_DELAY)
     finally:
+        mcp_task.cancel()
         reader.cancel()
 
 

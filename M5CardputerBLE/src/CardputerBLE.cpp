@@ -110,6 +110,10 @@ void BLE_Class::begin(const char* deviceName, bool autoAdvertise)
 
     NimBLEDevice::init(name);
 
+    // 请求最大 MTU，让音频帧等信息能在一个通知内发送，避免分包导致的
+    // 数据错乱（默认 MTU=23 导致 ~400 字节的音频帧被切成 20+ 个分包）。
+    NimBLEDevice::setMTU(512);
+
     _server = NimBLEDevice::createServer();
     _server->setCallbacks(new BLE_ServerCallbacks());
 
