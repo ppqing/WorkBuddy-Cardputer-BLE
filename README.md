@@ -131,10 +131,30 @@ pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
 从 [Releases](https://github.com/ppqing/WorkBuddy-Cardputer-BLE/releases) 下载最新版本：
 
 - `ask-master.exe` —— 预编译服务端（已内置 `ble_proxy.py`，单文件即可运行）
-- `faster-whisper-small.zip` —— 语音转写模型（解压到项目目录下的 `models/faster-whisper-small/`）
 - `ask-master-ble-merged.bin` —— Cardputer 固件（设备从未烧录过本固件时才需要）
 
 无需安装 Go，也无需编译。
+
+#### 语音转写模型（单独下载，不进 Release）
+
+模型需放到 `models/faster-whisper-small/`（faster-whisper 的 CTranslate2 格式，约 486MB）。
+
+**镜像渠道（国内直连，推荐）** — [ModelScope Systran/faster-whisper-small](https://modelscope.cn/models/Systran/faster-whisper-small)：
+
+```powershell
+$dir = "models\faster-whisper-small"
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+foreach ($f in @("config.json","model.bin","tokenizer.json","vocabulary.txt")) {
+  curl.exe -L -o "$dir\$f" "https://modelscope.cn/api/v1/models/Systran/faster-whisper-small/repo?Revision=master&FilePath=$f"
+}
+```
+
+**官方渠道** — [Hugging Face Systran/faster-whisper-small](https://huggingface.co/Systran/faster-whisper-small)：
+
+```bash
+pip install huggingface_hub
+huggingface-cli download Systran/faster-whisper-small --local-dir models/faster-whisper-small
+```
 
 ### 3. 烧录固件 / Flash the firmware
 
@@ -231,9 +251,13 @@ python daemon_keeper.py
 1. 安装 Python 依赖（BLE + 语音转写 + 性能监控）：
    pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
 
-2. 下载预编译服务端：从 GitHub Releases 下载 `ask-master.exe` 放到 `<项目目录>`，
-   并下载 `faster-whisper-small.zip` 解压为 `<项目目录>/models/faster-whisper-small/`。
+2. 下载预编译服务端：从 GitHub Releases 下载 `ask-master.exe` 放到 `<项目目录>`。
    无需安装 Go，也无需编译。
+
+3. 下载语音转写模型到 `<项目目录>/models/faster-whisper-small/`（约 486MB）：
+   - 国内镜像（推荐）：ModelScope Systran/faster-whisper-small，命令见项目 README「语音转写模型」节
+   - 官方渠道：`huggingface-cli download Systran/faster-whisper-small --local-dir models/faster-whisper-small`
+   - 无模型时语音输入不可用，但 confirm/choose/ask-human 键盘输入不受影响
 
 ## 运行
 
@@ -496,7 +520,7 @@ efontCN 只覆盖 GB2312（6763 字）。词库已过滤，但 daemon 发送 GB2
 <summary><b>语音转写不工作 / Voice transcription fails</b></summary>
 
 - 确认 `faster-whisper` 已安装
-- 确认模型已就位：`<项目目录>/models/faster-whisper-small/`（从 Release 下载 `faster-whisper-small.zip` 解压；首次运行不再自动联网下载）
+- 确认模型已就位：`<项目目录>/models/faster-whisper-small/`（从 ModelScope 镜像或 Hugging Face 下载，命令见 README「语音转写模型」节）
 - GPU 模式下若报 `cublas64_12.dll` 缺失，安装 `pip install nvidia-cublas-cu12`
 - 模型加载必须在 BLE 初始化之前（`ble_proxy.py` 已处理，勿改动顺序）
 - 检查日志 `daemon.log` 中 `whisper: model preloaded (cuda/float16)` 是否出现
