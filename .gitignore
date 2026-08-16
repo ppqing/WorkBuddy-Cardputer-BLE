@@ -97,3 +97,11 @@ firmware/ask_master_ble/build/
 daemon.log
 proxy_out.txt
 proxy_err.txt
+.state/
+
+# =============================================================================
+# Local models & release assets (distributed via GitHub Releases)
+# =============================================================================
+models/
+release-assets/
+.gocache/

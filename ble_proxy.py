@@ -120,9 +120,32 @@ def write_wav(path, samples, rate=AUDIO_SAMPLE_RATE):
 # faster-whisper transcription (lazy, cached model)
 # ---------------------------------------------------------------------------
 
-# 语音识别模型。可选 tiny/base/small/medium/large-v3。
+# 语音识别模型。默认使用仓库内 models/faster-whisper-small（CTranslate2 格式，
+# 本地文件，无需联网下载）；也可用环境变量 ASK_MASTER_WHISPER_MODEL 覆盖，
+# 或改为 tiny/base/small/medium/large-v3 让 faster-whisper 从 Hugging Face 拉取。
 # 模型越大中文识别越准，但转写越慢、内存/磁盘占用越大。
-WHISPER_MODEL = "medium"
+def _resolve_model_path():
+    """Locate the whisper model directory (local-first, no network needed).
+
+    Priority:
+      1. ASK_MASTER_WHISPER_MODEL env var (explicit override)
+      2. <exe dir>/models/faster-whisper-small   (set by the Go bridge)
+      3. <script dir>/models/faster-whisper-small (dev: script sits next to exe)
+      4. <cwd>/models/faster-whisper-small       (daemon_keeper.py fallback)
+      5. "small"  (download from Hugging Face, needs network)
+    """
+    candidates = [
+        os.environ.get("ASK_MASTER_WHISPER_MODEL"),
+        os.path.join(os.environ.get("ASK_MASTER_BLE_DIR", ""), "models", "faster-whisper-small"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "faster-whisper-small"),
+        os.path.join(os.getcwd(), "models", "faster-whisper-small"),
+    ]
+    for c in candidates:
+        if c and os.path.isdir(c):
+            return c
+    return "small"
+
+WHISPER_MODEL = _resolve_model_path()
 WHISPER_DEVICE = "cuda"       # 有 NVIDIA GPU 用 cuda，否则用 cpu
 WHISPER_COMPUTE = "float16"   # GPU: float16/int8_float16；CPU: int8
 WHISPER_BEAM_SIZE = 5         # 5 质量更高（GPU 下速度足够快）

@@ -105,7 +105,7 @@ When the model needs you, it pings a tiny screen on your desk — not your chat.
 |---|---|
 | BLE 传输 / BLE transport | 蓝牙直连，无需 WiFi / Direct Bluetooth, no WiFi needed |
 | 中文拼音输入法 / Pinyin IME | 410 音节 + 8461 词组，支持单字和词组联想 |
-| 语音输入 / Voice input | 按住 Ctrl 说话，faster-whisper (medium, GPU) 转写 |
+| 语音输入 / Voice input | 按住 Ctrl 说话，faster-whisper (small, 本地模型, GPU) 转写 |
 | 键盘转发 / Keyboard forwarding | Cardputer 的 Enter/Backspace 直接控制电脑聚焦窗口 |
 | 性能监控 / Performance monitor | 待机界面显示 CPU/GPU/内存/网速 |
 | 电量显示 / Battery indicator | 状态栏百分比 + 图标，颜色分级 |
@@ -126,11 +126,15 @@ When the model needs you, it pings a tiny screen on your desk — not your chat.
 pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
 ```
 
-### 2. 构建服务端 / Build the server
+### 2. 下载服务端 / Download the server
 
-```bash
-go build -o ask-master.exe .
-```
+从 [Releases](https://github.com/ppqing/WorkBuddy-Cardputer-BLE/releases) 下载最新版本：
+
+- `ask-master.exe` —— 预编译服务端（已内置 `ble_proxy.py`，单文件即可运行）
+- `faster-whisper-small.zip` —— 语音转写模型（解压到项目目录下的 `models/faster-whisper-small/`）
+- `ask-master-ble-merged.bin` —— Cardputer 固件（设备从未烧录过本固件时才需要）
+
+无需安装 Go，也无需编译。
 
 ### 3. 烧录固件 / Flash the firmware
 
@@ -148,13 +152,13 @@ python daemon_keeper.py
 
 ### 5. 配置 MCP 客户端 / Configure MCP client
 
-在你的 agent 的 MCP 配置文件中添加：
+在你的 agent 的 MCP 配置文件中添加（把 `<项目目录>` 换成实际路径）：
 
 ```json
 {
   "mcpServers": {
     "ask-master": {
-      "command": "d:\\dev\\WorkBuddy-Cardputer-BLE\\ask-master.exe",
+      "command": "<项目目录>\\ask-master.exe",
       "args": ["--transport", "ble"]
     }
   }
@@ -177,7 +181,7 @@ python daemon_keeper.py
 {
   "mcpServers": {
     "ask-master": {
-      "command": "d:\\dev\\WorkBuddy-Cardputer-BLE\\ask-master.exe",
+      "command": "<项目目录>\\ask-master.exe",
       "args": ["--transport", "ble"],
       "type": "stdio"
     }
@@ -191,7 +195,7 @@ python daemon_keeper.py
 {
   "mcpServers": {
     "ask-master": {
-      "command": "d:\\dev\\WorkBuddy-Cardputer-BLE\\ask-master.exe",
+      "command": "<项目目录>\\ask-master.exe",
       "args": ["--transport", "ble"]
     }
   }
@@ -204,7 +208,7 @@ python daemon_keeper.py
 {
   "mcpServers": {
     "ask-master": {
-      "command": "d:\\dev\\WorkBuddy-Cardputer-BLE\\ask-master.exe",
+      "command": "<项目目录>\\ask-master.exe",
       "args": ["--transport", "ble"]
     }
   }
@@ -224,14 +228,12 @@ python daemon_keeper.py
 
 ## 环境搭建（一次性，仅当环境未就绪时执行）
 
-1. 安装依赖
-   - Python 依赖（BLE + 语音转写 + 性能监控）：
-     pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
-   - Go 1.22+
+1. 安装 Python 依赖（BLE + 语音转写 + 性能监控）：
+   pip install bleak faster-whisper pynvml psutil nvidia-cublas-cu12
 
-2. 构建服务端
-   cd <项目目录>
-   go build -o ask-master.exe .
+2. 下载预编译服务端：从 GitHub Releases 下载 `ask-master.exe` 放到 `<项目目录>`，
+   并下载 `faster-whisper-small.zip` 解压为 `<项目目录>/models/faster-whisper-small/`。
+   无需安装 Go，也无需编译。
 
 ## 运行
 
@@ -362,12 +364,17 @@ python daemon_keeper.py
 **语音模型配置**（`ble_proxy.py`）：
 
 ```python
-WHISPER_MODEL = "medium"    # tiny/base/small/medium/large-v3
+WHISPER_MODEL = _resolve_model_path()   # 默认 <项目目录>/models/faster-whisper-small/
 WHISPER_DEVICE = "cuda"     # 有 NVIDIA GPU 用 cuda，否则 cpu
 WHISPER_COMPUTE = "float16" # GPU: float16；CPU: int8
 WHISPER_LANGUAGE = "zh"
 WHISPER_INITIAL_PROMPT = "以下是普通话的句子，请使用简体中文输出。"
 ```
+
+- 模型优先从本地 `models/faster-whisper-small/` 加载（随 Release 分发，无需联网下载）
+- 可用环境变量 `ASK_MASTER_WHISPER_MODEL` 覆盖为其他本地路径
+- 如需用别的尺寸，把 `_resolve_model_path()` 改成 `"tiny"` / `"base"` / `"small"` / `"medium"` 等，
+  由 faster-whisper 自动从 Hugging Face 下载（需能访问 huggingface.co）
 
 ### 键盘转发（IDLE 待机界面）
 
@@ -488,7 +495,8 @@ efontCN 只覆盖 GB2312（6763 字）。词库已过滤，但 daemon 发送 GB2
 <details>
 <summary><b>语音转写不工作 / Voice transcription fails</b></summary>
 
-- 确认 `faster-whisper` 已安装，且模型已下载（首次运行自动下载，medium 约 1.5GB）
+- 确认 `faster-whisper` 已安装
+- 确认模型已就位：`<项目目录>/models/faster-whisper-small/`（从 Release 下载 `faster-whisper-small.zip` 解压；首次运行不再自动联网下载）
 - GPU 模式下若报 `cublas64_12.dll` 缺失，安装 `pip install nvidia-cublas-cu12`
 - 模型加载必须在 BLE 初始化之前（`ble_proxy.py` 已处理，勿改动顺序）
 - 检查日志 `daemon.log` 中 `whisper: model preloaded (cuda/float16)` 是否出现
@@ -524,6 +532,8 @@ M5Launcher 用自己的分区表覆盖了 app 分区。请用 esptool 全量烧�
 ├── gen_pinyin_dict.py           — 单字拼音词库生成器
 ├── gen_pinyin_phrases.py        — 词组拼音词库生成器
 ├── fwbuild.ps1                  — 固件编译脚本 (Windows)
+├── libraries/                   — 本地 Arduino 库 (ArduinoJson, 随项目分发)
+├── models/faster-whisper-small/ — 语音转写模型 (随 Release 分发, 不入库)
 ├── firmware/ask_master_ble/     — BLE 固件源码
 │   ├── ask_master_ble.ino       — 主程序 (状态机, BLE, 键盘, 语音)
 │   ├── ui.cpp / ui.h            — UI 渲染 (canvas, 字体, 换行, 电池, 性能监控)

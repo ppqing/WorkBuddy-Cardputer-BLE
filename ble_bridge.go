@@ -184,6 +184,12 @@ func (b *BLEBridge) Start() error {
 	// Run the proxy from its own directory so it never depends on the
 	// working directory the MCP client happened to launch us with.
 	cmd.Dir = filepath.Dir(script)
+	// Tell the proxy where the executable lives so it can locate local
+	// assets (e.g. the whisper model under models/) in both dev and the
+	// extracted-temp-file production layout.
+	if exe, err := os.Executable(); err == nil {
+		cmd.Env = append(os.Environ(), "ASK_MASTER_BLE_DIR="+filepath.Dir(exe))
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("proxy stdin: %w", err)
