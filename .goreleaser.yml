@@ -48,26 +48,3 @@ changelog:
 
 release:
   replace_existing_artifacts: true
-
-brews:
-  - name: ask-master
-    homepage: https://github.com/mhrsntrk/ask-master
-    description: "Physical Human-in-the-Loop MCP server for AI coding agents using M5Stack Cardputer"
-    license: MIT
-    directory: Formula
-    repository:
-      owner: mhrsntrk
-      name: homebrew-ask-master
-      token: "{{ .Env.HOMEBREW_GITHUB_API_TOKEN }}"
-    service: |
-      # The daemon binds to all interfaces so the Cardputer device can
-      # reach it from the LAN. The WS handler enforces an IP-binding
-      # check (peer IP must match the latest UDP beacon IP), so random
-      # LAN peers cannot hijack the human-in-the-loop channel even
-      # though the listener itself is reachable.
-      run [opt_bin/"ask-master", "--ws-addr", "0.0.0.0:8765"]
-      keep_alive true
-      log_path var/"log/ask-master.log"
-      error_log_path var/"log/ask-master.error.log"
-    test: |
-      system "#{bin}/ask-master", "--version"
